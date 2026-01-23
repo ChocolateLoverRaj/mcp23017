@@ -1,0 +1,6 @@
+{
+    "rust-analyzer.cargo.features": [
+        "defmt",
+        "stm32f103c8"
+    ]
+}
