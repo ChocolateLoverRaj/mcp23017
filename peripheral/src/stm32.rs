@@ -75,8 +75,8 @@ impl GpioPin for Stm32GpioPin<'_> {
         }
     }
 
-    fn level(&mut self) -> PinState {
-        bool::from(match &mut self._type {
+    fn level(&self) -> PinState {
+        bool::from(match &self._type {
             Stm32GpioPinType::ExtiInput { pin, pull: _ } => pin.get_level(),
             Stm32GpioPinType::Flex { pin, speed: _ } => pin.get_level(),
         })

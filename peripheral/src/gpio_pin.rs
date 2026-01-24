@@ -1,30 +1,5 @@
 pub use embedded_hal::digital::PinState;
-
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IoDirection {
-    Output,
-    Input,
-}
-
-impl From<bool> for IoDirection {
-    fn from(value: bool) -> Self {
-        if value {
-            IoDirection::Input
-        } else {
-            IoDirection::Output
-        }
-    }
-}
-
-impl From<IoDirection> for bool {
-    fn from(value: IoDirection) -> Self {
-        match value {
-            IoDirection::Output => false,
-            IoDirection::Input => true,
-        }
-    }
-}
+pub use mcp23017_common::IoDirection;
 
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,7 +29,7 @@ impl From<InterruptMode> for bool {
 pub trait GpioPin {
     fn configure(&mut self, io_direction: IoDirection, pull_up_enabled: bool, level: PinState);
     /// This function will not be called if this pin is configured to be in output mode.
-    fn level(&mut self) -> PinState;
+    fn level(&self) -> PinState;
     /// Returns if the pin is capable of receiving interrupts (in input mode).
     fn can_wait(&mut self) -> bool;
     /// Returns when the pin's level becomes the specified level.

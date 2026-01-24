@@ -1,4 +1,4 @@
-use core::{future::pending, iter::zip, mem, ops::Range};
+use core::{future::pending, iter::zip, mem};
 
 use collect_array_ext_trait::CollectArray;
 use embassy_futures::{
@@ -7,7 +7,10 @@ use embassy_futures::{
 };
 use embedded_hal::digital::PinState;
 use embedded_hal_async::digital::Wait;
-use strum::{AsRefStr, Display, EnumCount, FromRepr, VariantArray, VariantNames};
+use mcp23017_common::{
+    AB, FormatPinIndex, InterruptControl, N_TOTAL_GPIO_PINS, Register, RegisterType,
+};
+use strum::{AsRefStr, Display, EnumCount, VariantArray, VariantNames};
 
 use crate::{
     InterruptMode, InterruptPin,
@@ -26,113 +29,6 @@ enum PinProperty {
     InputInverted,
     InterruptEnabled,
     CompareValue,
-}
-
-/// There are 8 GPIO pins for set A and set B
-const N_GPIO_PINS_PER_SET: usize = 8;
-const N_TOTAL_GPIO_PINS: usize = N_GPIO_PINS_PER_SET * AB::COUNT;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumCount, VariantArray)]
-enum AB {
-    A,
-    B,
-}
-
-impl AB {
-    pub fn set_index(&self) -> usize {
-        match self {
-            Self::A => 0,
-            Self::B => 1,
-        }
-    }
-
-    pub fn from_index(index: usize) -> Self {
-        match index / N_GPIO_PINS_PER_SET {
-            0 => Self::A,
-            1 => Self::B,
-            _ => unreachable!(),
-        }
-    }
-
-    pub fn starting_index(&self) -> usize {
-        self.set_index() * N_GPIO_PINS_PER_SET
-    }
-
-    pub fn range(&self) -> Range<usize> {
-        self.set_index() * N_GPIO_PINS_PER_SET..(self.set_index() + 1) * N_GPIO_PINS_PER_SET
-    }
-}
-
-#[cfg(feature = "defmt")]
-impl defmt::Format for AB {
-    fn format(&self, fmt: defmt::Formatter) {
-        let str = match self {
-            Self::A => "A",
-            Self::B => "B",
-        };
-        defmt::write!(fmt, "{}", str);
-    }
-}
-
-pub struct FormatPinIndex(usize);
-
-#[cfg(feature = "defmt")]
-impl defmt::Format for FormatPinIndex {
-    fn format(&self, fmt: defmt::Formatter) {
-        let letter = AB::from_index(self.0);
-        let index_within_letter = self.0 % N_GPIO_PINS_PER_SET;
-        defmt::write!(fmt, "{}{}", letter, index_within_letter);
-    }
-}
-
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumCount, FromRepr)]
-#[repr(u8)]
-enum RegisterType {
-    IODIR,
-    IPOL,
-    GPINTEN,
-    DEFVAL,
-    INTCON,
-    IOCON,
-    GPPU,
-    INTF,
-    INTCAP,
-    GPIO,
-    OLAT,
-}
-
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Register {
-    _type: RegisterType,
-    ab: AB,
-}
-
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InterruptControl {
-    /// Compare with `DEFVAL` register
-    CompareWithConfiguredValue,
-    CompareWithPreviousValue,
-}
-
-impl From<bool> for InterruptControl {
-    fn from(value: bool) -> Self {
-        match value {
-            true => Self::CompareWithConfiguredValue,
-            false => Self::CompareWithPreviousValue,
-        }
-    }
-}
-
-impl From<InterruptControl> for bool {
-    fn from(value: InterruptControl) -> Self {
-        match value {
-            InterruptControl::CompareWithConfiguredValue => true,
-            InterruptControl::CompareWithPreviousValue => false,
-        }
-    }
 }
 
 pub struct Mcp23017<P, I, R> {
@@ -166,6 +62,9 @@ pub struct Mcp23017<P, I, R> {
     /// Can only be cleared by reading the GPIO or captured pin state
     int_flags: [bool; N_TOTAL_GPIO_PINS],
     int_captured_value: [PinState; N_TOTAL_GPIO_PINS],
+    /// This is not a register but I think the chip needs to keep track of this in order to
+    /// interrupt-on-change. It needs to know what the last known state is.
+    known_input_states: [PinState; N_TOTAL_GPIO_PINS],
 }
 
 impl<P: GpioPin, I: InterruptPin, R: Wait> Mcp23017<P, I, R> {
@@ -193,6 +92,7 @@ impl<P: GpioPin, I: InterruptPin, R: Wait> Mcp23017<P, I, R> {
             interrupt_control: [InterruptControl::CompareWithPreviousValue; _],
             int_flags: [false; _],
             int_captured_value: [PinState::Low; _],
+            known_input_states: [PinState::Low; _],
         };
         s.update_all_pins();
         s.update_interrupts();
@@ -216,6 +116,7 @@ impl<P: GpioPin, I: InterruptPin, R: Wait> Mcp23017<P, I, R> {
         self.interrupt_control = [InterruptControl::CompareWithPreviousValue; _];
         self.int_flags = [false; _];
         self.int_captured_value = [PinState::Low; _];
+        self.known_input_states = [PinState::Low; _];
         self.update_all_pins();
         self.update_interrupts();
     }
@@ -244,7 +145,9 @@ impl<P: GpioPin, I: InterruptPin, R: Wait> Mcp23017<P, I, R> {
         if let Some(&address) = bytes.first() {
             self.selected_address = address;
             for &byte in &bytes[1..] {
-                if let Some(register) = register_from_addr(self.selected_address, self.bank_mode) {
+                if let Some(register) =
+                    Register::from_address(self.selected_address, self.bank_mode)
+                {
                     self.write_register(register, byte);
                 } else {
                     #[cfg(feature = "defmt")]
@@ -261,7 +164,7 @@ impl<P: GpioPin, I: InterruptPin, R: Wait> Mcp23017<P, I, R> {
     pub fn prepare_read_buffer(&mut self, buffer: &mut [u8]) {
         let mut address = self.selected_address;
         for byte in buffer {
-            if let Some(register) = register_from_addr(address, self.bank_mode) {
+            if let Some(register) = Register::from_address(address, self.bank_mode) {
                 *byte = self.read_register(register);
             } else {
                 #[cfg(feature = "defmt")]
@@ -278,6 +181,9 @@ impl<P: GpioPin, I: InterruptPin, R: Wait> Mcp23017<P, I, R> {
     /// bytes read by the controller.
     pub fn confirm_bytes_read(&mut self, bytes_read: usize) {
         for _ in 0..bytes_read {
+            if let Some(register) = Register::from_address(self.selected_address, self.bank_mode) {
+                self.read_side_effects(register);
+            }
             self.advance_address();
         }
     }
@@ -542,6 +448,8 @@ impl<P: GpioPin, I: InterruptPin, R: Wait> Mcp23017<P, I, R> {
             RegisterType::IOCON => {
                 self.bank_mode = (value & 1 << 7) != 0;
                 self.mirror_interrupts = (value & 1 << 6) != 0;
+                #[cfg(feature = "defmt")]
+                defmt::info!("mirror interrupts: {}", self.mirror_interrupts);
                 self.sequential_mode = (value & 1 << 5) != 0;
                 // what is slew rate idk
                 self.int_mode = ((value & 1 << 2) != 0).into();
@@ -554,7 +462,7 @@ impl<P: GpioPin, I: InterruptPin, R: Wait> Mcp23017<P, I, R> {
 
     /// Reads the register based on the saved address.
     /// Does not update the address pointer
-    fn read_register(&mut self, register: Register) -> u8 {
+    fn read_register(&self, register: Register) -> u8 {
         match register._type {
             RegisterType::IODIR => {
                 let mut value = Default::default();
@@ -580,7 +488,7 @@ impl<P: GpioPin, I: InterruptPin, R: Wait> Mcp23017<P, I, R> {
             }
             RegisterType::GPIO => {
                 let mut value = Default::default();
-                for (i, pin) in (&mut self.gpio_pins[register.ab.range()])
+                for (i, pin) in (&self.gpio_pins[register.ab.range()])
                     .into_iter()
                     .enumerate()
                 {
@@ -593,14 +501,62 @@ impl<P: GpioPin, I: InterruptPin, R: Wait> Mcp23017<P, I, R> {
                         },
                     )) << i;
                 }
-                // The interrupt is cleared
-                self.int_flags[register.ab.range()].fill(false);
-                #[cfg(feature = "defmt")]
-                defmt::warn!("cleared interrupts for {}", register.ab);
-                self.update_interrupts();
+                value
+            }
+            RegisterType::INTCAP => {
+                let mut value = Default::default();
+                for (i, pin_state) in self.int_captured_value[register.ab.range()]
+                    .iter()
+                    .copied()
+                    .enumerate()
+                {
+                    value |= u8::from(bool::from(pin_state)) << i;
+                }
+                value
+            }
+            RegisterType::INTF => {
+                let mut value = Default::default();
+                for (i, flag) in self.int_flags[register.ab.range()]
+                    .iter()
+                    .copied()
+                    .enumerate()
+                {
+                    value |= u8::from(flag) << i;
+                }
                 value
             }
             register_type => todo!("read {register_type:?}"),
+        }
+    }
+
+    fn read_side_effects(&mut self, register: Register) {
+        match register._type {
+            RegisterType::GPIO => {
+                // Update the last known input state
+                // FIXME: If the state changes between the read and read side effects, the last known value will be in an unexpected state
+                for (i, state) in self.known_input_states[register.ab.range()]
+                    .iter_mut()
+                    .enumerate()
+                {
+                    *state = match self.io_directions[i + register.ab.starting_index()] {
+                        IoDirection::Output => {
+                            self.output_latches[i + register.ab.starting_index()].into()
+                        }
+                        IoDirection::Input => {
+                            self.gpio_pins[i + register.ab.starting_index()].level()
+                        }
+                    };
+                }
+                // The interrupt is cleared
+                self.int_flags[register.ab.range()].fill(false);
+                self.update_interrupts();
+            }
+            RegisterType::INTCAP => {
+                // The interrupt is cleared
+                self.int_flags[register.ab.range()].fill(false);
+                self.update_interrupts();
+            }
+            _ => {}
         }
     }
 
@@ -627,18 +583,11 @@ impl<P: GpioPin, I: InterruptPin, R: Wait> Mcp23017<P, I, R> {
                                     }
                                     InterruptControl::CompareWithPreviousValue => {
                                         // the docs are unclear about what the "previous value" is
-                                        // i'm going to assume it's the previously captured value
-                                        self.int_captured_value[i]
+                                        self.known_input_states[i]
                                     }
                                 };
                                 if pin.can_wait() {
                                     let level = !compare_value;
-                                    #[cfg(feature = "defmt")]
-                                    defmt::warn!(
-                                        "pin {} waiting for level to be {}",
-                                        i,
-                                        defmt::Debug2Format(&level)
-                                    );
                                     pin.wait_for_level(level).await;
                                 } else {
                                     #[cfg(feature = "defmt")]
@@ -675,6 +624,7 @@ impl<P: GpioPin, I: InterruptPin, R: Wait> Mcp23017<P, I, R> {
                     );
                     self.int_flags[index] = true;
                     self.int_captured_value[index] = level;
+                    self.known_input_states[index] = level;
                     self.update_interrupts();
                 }
             };
@@ -709,32 +659,4 @@ fn advance_address(current_address: u8, mode: AdvanceAddressMode) -> u8 {
             }
         }
     }
-}
-
-/// If the address is invalid, returns `None`
-fn register_from_addr(address: u8, bank_mode: bool) -> Option<Register> {
-    Some({
-        if bank_mode {
-            if address < RegisterType::COUNT as u8 {
-                Register {
-                    ab: AB::A,
-                    _type: RegisterType::from_repr(address)?,
-                }
-            } else {
-                Register {
-                    ab: AB::B,
-                    _type: RegisterType::from_repr(address - RegisterType::COUNT as u8)?,
-                }
-            }
-        } else {
-            Register {
-                ab: if address.is_multiple_of(2) {
-                    AB::A
-                } else {
-                    AB::B
-                },
-                _type: RegisterType::from_repr(address / 2)?,
-            }
-        }
-    })
 }

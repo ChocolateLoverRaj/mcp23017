@@ -1,0 +1,11 @@
+[package]
+name = "mcp23017_common"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+defmt = { version = "1.0.1", optional = true }
+strum = { version = "0.27.2", default-features = false, features = ["derive"] }
+
+[features]
+defmt = ["dep:defmt"]
