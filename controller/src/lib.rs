@@ -6,7 +6,7 @@ use core::convert::Infallible;
 
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex, signal::Signal};
 use embedded_hal::digital::PinState;
-use embedded_hal_async::{delay::DelayNs, digital::OutputPin};
+use embedded_hal_async::delay::DelayNs;
 pub use input::*;
 use mcp23017_common::{AB, IoDirection, N_TOTAL_GPIO_PINS, Register, RegisterType};
 

@@ -21,18 +21,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 
 [[package]]
-name = "controller"
-version = "0.1.0"
-dependencies = [
- "defmt",
- "embassy-futures",
- "embassy-sync",
- "embedded-hal",
- "embedded-hal-async",
- "mcp23017_common",
-]
-
-[[package]]
 name = "critical-section"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -160,6 +148,18 @@ name = "mcp23017_common"
 version = "0.1.0"
 dependencies = [
  "strum",
+]
+
+[[package]]
+name = "mcp23017_controller"
+version = "0.1.0"
+dependencies = [
+ "defmt",
+ "embassy-futures",
+ "embassy-sync",
+ "embedded-hal",
+ "embedded-hal-async",
+ "mcp23017_common",
 ]
 
 [[package]]

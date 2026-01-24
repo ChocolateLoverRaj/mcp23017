@@ -1,7 +1,8 @@
 use core::{array, fmt::Debug, slice};
 
 use embassy_futures::select::{Either, select};
-use embedded_hal::{digital::PinState, i2c::Operation};
+pub use embedded_hal::digital::PinState;
+use embedded_hal::i2c::Operation;
 use embedded_hal_async::digital::Wait;
 use mcp23017_common::{AB, IoDirection, N_GPIO_PINS_PER_SET, Register, RegisterType};
 
@@ -188,11 +189,19 @@ impl<ResetPin, I2c: embedded_hal_async::i2c::I2c, InterruptPin: Wait>
                 None
             }
         });
-        let self_pin_index_within_byte = self.index / N_GPIO_PINS_PER_SET;
+        let self_pin_index_within_byte = self.index % N_GPIO_PINS_PER_SET;
         for (i, captured_state) in captured_states.iter().copied().enumerate() {
             if i != self_pin_index_within_byte
                 && let Some(captured_state) = captured_state
             {
+                #[cfg(feature = "defmt")]
+                defmt::trace!(
+                    "Signaling {} as {}. flags byte: {:010b}, captured byte: {:010b}",
+                    AB::from_index(self.index).starting_index() + i,
+                    defmt::Debug2Format(&captured_state),
+                    flags_byte,
+                    captured_byte,
+                );
                 self.mcp.unread_interrupts[AB::from_index(self.index).starting_index() + i]
                     .signal(captured_state);
             }
@@ -223,8 +232,16 @@ impl<ResetPin, I2c: embedded_hal_async::i2c::I2c, InterruptPin: Wait>
         })
         .await
         {
-            Either::First(pin_state) => pin_state,
-            Either::Second(result) => result?,
+            Either::First(pin_state) => {
+                #[cfg(feature = "defmt")]
+                defmt::trace!("got pin state from signal");
+                pin_state
+            }
+            Either::Second(result) => {
+                #[cfg(feature = "defmt")]
+                defmt::trace!("got pin state from handling interrupts ourselves");
+                result?
+            }
         };
         self.current_state = pin_state;
         Ok(())
