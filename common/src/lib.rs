@@ -173,3 +173,28 @@ impl From<IoDirection> for bool {
         }
     }
 }
+
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InterruptMode {
+    OpenDrain,
+    ActiveDriver,
+}
+
+impl From<bool> for InterruptMode {
+    fn from(value: bool) -> Self {
+        match value {
+            true => Self::OpenDrain,
+            false => Self::ActiveDriver,
+        }
+    }
+}
+
+impl From<InterruptMode> for bool {
+    fn from(value: InterruptMode) -> Self {
+        match value {
+            InterruptMode::OpenDrain => true,
+            InterruptMode::ActiveDriver => false,
+        }
+    }
+}

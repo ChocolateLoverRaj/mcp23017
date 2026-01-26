@@ -8,12 +8,12 @@ use embassy_futures::{
 use embedded_hal::digital::PinState;
 use embedded_hal_async::digital::Wait;
 use mcp23017_common::{
-    AB, FormatPinIndex, InterruptControl, N_TOTAL_GPIO_PINS, Register, RegisterType,
+    AB, FormatPinIndex, InterruptControl, InterruptMode, N_TOTAL_GPIO_PINS, Register, RegisterType,
 };
 use strum::{AsRefStr, Display, EnumCount, VariantArray, VariantNames};
 
 use crate::{
-    InterruptMode, InterruptPin,
+    InterruptPin,
     gpio_pin::{GpioPin, IoDirection},
     reset_pin::ResetPin,
 };

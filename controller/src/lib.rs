@@ -1,46 +1,28 @@
 #![no_std]
 mod input;
+pub mod mode;
+mod output;
+mod pin;
 mod util;
+mod watch;
 
-use core::convert::Infallible;
+use core::{array, convert::Infallible, future::pending};
 
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex, signal::Signal};
-use embedded_hal::digital::PinState;
-use embedded_hal_async::delay::DelayNs;
-pub use input::*;
-use mcp23017_common::{AB, IoDirection, N_TOTAL_GPIO_PINS, Register, RegisterType};
+use embassy_futures::select::{Either, select};
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, watch::Watch};
+use embedded_hal::digital::{ErrorType, PinState};
+use embedded_hal_async::{
+    delay::DelayNs,
+    digital::{InputPin, OutputPin, StatefulOutputPin, Wait},
+};
+use mcp23017_common::{
+    AB, InterruptControl, IoDirection, N_TOTAL_GPIO_PINS, Register, RegisterType,
+};
+pub use pin::*;
 
 type M = CriticalSectionRawMutex;
 
 const BASE_ADDRESS: u8 = 0x20;
-
-struct RegistersData {
-    pub io_directions: [IoDirection; N_TOTAL_GPIO_PINS],
-    pub pull_ups_enabled: [bool; N_TOTAL_GPIO_PINS],
-    pub interrupts_enabled: [bool; N_TOTAL_GPIO_PINS],
-}
-
-impl Default for RegistersData {
-    fn default() -> Self {
-        Self {
-            io_directions: [IoDirection::Input; _],
-            pull_ups_enabled: [false; _],
-            interrupts_enabled: [false; _],
-        }
-    }
-}
-
-/// Currently this heavily uses the Embassy ecosystem.
-/// If this doesn't work for you for some reason, make an issue.
-pub struct Mcp23017<ResetPin, I2c, InterruptPin> {
-    pub(crate) reset_pin: ResetPin,
-    pub(crate) i2c: Mutex<M, I2c>,
-    pub(crate) address_lower_bits: [bool; 3],
-    pub(crate) interrupt_pin: Mutex<M, InterruptPin>,
-    pub(crate) unread_interrupts: [Signal<M, PinState>; N_TOTAL_GPIO_PINS],
-    pub(crate) borrowed_pins: Mutex<M, [bool; N_TOTAL_GPIO_PINS]>,
-    pub(crate) registers_data: Mutex<M, RegistersData>,
-}
 
 fn address(address_lower_bits: [bool; 3]) -> u8 {
     let mut address = BASE_ADDRESS;
@@ -52,111 +34,212 @@ fn address(address_lower_bits: [bool; 3]) -> u8 {
     address
 }
 
-impl<
-    ResetPin: embedded_hal::digital::OutputPin<Error = Infallible>,
-    I2c: embedded_hal_async::i2c::I2c,
-    InterruptPin,
-> Mcp23017<ResetPin, I2c, InterruptPin>
-{
-    /// When initializing the reset pin keep it high.
-    /// Configure the I2C to be either 100 kHz or 400 kHz.
-    /// Please make sure the MCP is reset.
-    /// It is recommended to call [`Self::reset`].  
-    ///
-    /// Currently this requires 1 reset pin.
-    /// Technically you don't need to connect to the reset pin.
-    /// Make an issue if you want to be able use this without a reset pin.
-    ///
-    /// Currently this uses a single interrupt pin.
-    /// Technically you don't need the interrupt pin if you aren't going to use interrupt based inputs.
-    /// Make an issue if you want to be able to use this without an interrupt pin.
-    /// Technically you can use two interrupt pins, one for A and one for B.
-    /// However, this shouldn't improve performance much.
-    /// Make an issue if you need separate interrupt pins for A and B.
-    pub async fn new(
-        mut reset_pin: ResetPin,
-        mut i2c: I2c,
-        address_lower_bits: [bool; 3],
-        interrupt_pin: InterruptPin,
-        delay: &mut impl DelayNs,
-    ) -> Result<Self, I2c::Error> {
-        reset_pin.set_low();
-        delay.delay_us(1).await;
-        reset_pin.set_high();
+#[derive(Debug)]
+pub enum RunError<ResetPinError, InterruptPinError, I2cError> {
+    ResetPin(ResetPinError),
+    InterruptPin(InterruptPinError),
+    I2c(I2cError),
+}
 
-        // Configure IOCON
-        i2c.write(
-            address(address_lower_bits),
-            &[
-                Register {
-                    _type: RegisterType::IOCON,
-                    ab: AB::A,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PinConfig {
+    direction: IoDirection,
+    pull_up_enabled: bool,
+    latch: PinState,
+    int_enabled: bool,
+    int_control: InterruptControl,
+    int_compare: PinState,
+}
+
+impl Default for PinConfig {
+    fn default() -> Self {
+        Self {
+            direction: IoDirection::Input,
+            pull_up_enabled: false,
+            int_enabled: false,
+            latch: PinState::Low,
+            int_control: InterruptControl::CompareWithPreviousValue,
+            int_compare: PinState::Low,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PinRequest {
+    new_config: PinConfig,
+    read: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PinResponse {
+    set_config: PinConfig,
+    read_state: Option<PinState>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ReadState2 {
+    Requested,
+    ProcessingRequest,
+    Done(PinState),
+}
+
+struct Mcp23017ImmutablePin {
+    /// Updated after successfully changing the configuration.
+    config: Watch<M, PinConfig, 1>,
+    /// Updated to request the runner to change the configuration.
+    requested_config: Watch<M, PinConfig, 1>,
+    /// Updated to request the runner to read the GPIO register,
+    /// and updated by the runner once it read it.
+    read: Watch<M, ReadState2, 2>,
+    /// Updated to request the runner to wait for an interrupt and read INTCAP.
+    /// The runner makes sure that any previous INTF is cleared so that only
+    /// captured states *after* a request to read the edge are used.
+    /// Updated by the runner once the runner reads INTCAP.
+    read_edge: Watch<M, ReadState2, 2>,
+    /// Used in input mode.
+    /// Updated by the runner with the value of GPIO or INTCAP.
+    watched_state: Watch<M, PinState, 1>,
+}
+
+struct Mcp23017Immutable {
+    pins: [Mcp23017ImmutablePin; N_TOTAL_GPIO_PINS],
+}
+
+pub struct Mcp23017<I2c, ResetPin, InterruptPin, Delay> {
+    i2c: I2c,
+    address_lower_bits: [bool; 3],
+    reset_pin: ResetPin,
+    interrupt_pin: InterruptPin,
+    delay: Delay,
+    immutable: Mcp23017Immutable,
+}
+
+impl<I2c: embedded_hal_async::i2c::I2c, ResetPin: OutputPin, InterruptPin: Wait, Delay: DelayNs>
+    Mcp23017<I2c, ResetPin, InterruptPin, Delay>
+{
+    pub fn run(
+        &mut self,
+    ) -> (
+        impl Future<Output = Result<(), RunError<ResetPin::Error, InterruptPin::Error, I2c::Error>>>,
+        [Pin<'_, mode::Input>; N_TOTAL_GPIO_PINS],
+    ) {
+        (
+            async {
+                self.reset_pin.set_low().await.map_err(RunError::ResetPin)?;
+                self.delay.delay_us(1).await;
+                self.reset_pin
+                    .set_high()
+                    .await
+                    .map_err(RunError::ResetPin)?;
+
+                // Configure IOCON
+                self.i2c
+                    .write(
+                        address(self.address_lower_bits),
+                        &[
+                            Register {
+                                _type: RegisterType::IOCON,
+                                ab: AB::A,
+                            }
+                            .address(false),
+                            // Enable interrupt mirroring and set interrupts to open-drain
+                            0b01000100,
+                        ],
+                    )
+                    .await
+                    .map_err(RunError::I2c)?;
+
+                let interrupt_pin_signal = Watch::<M, _, 1>::new();
+                match select(
+                    async {
+                        let sender = interrupt_pin_signal.sender();
+                        loop {
+                            self.interrupt_pin
+                                .wait_for_low()
+                                .await
+                                .map_err(RunError::InterruptPin)?;
+                            sender.send(PinState::Low);
+                            self.interrupt_pin
+                                .wait_for_high()
+                                .await
+                                .map_err(RunError::InterruptPin)?;
+                            sender.send(PinState::High);
+                        }
+                    },
+                    async {
+                        let mut receiver = interrupt_pin_signal.receiver().unwrap();
+                        loop {
+                            // Operations (each operation could be for A and/or B)
+                            // Write I/O direction
+                            // Write
+
+                            // Write pull up enabled
+                            // Write
+
+                            // Write latch
+                            // Write
+
+                            // Write interrupt compare
+                            // Write
+
+                            // Write interrupt control
+                            // Write
+
+                            // Write interrupt enabled
+                            // Write
+
+                            // let (pin_requests, handle_interrupt) = {
+                            //     let mut pin_requests =
+                            //         self.immutable.pin_requests.each_ref().map(Signal::try_take);
+                            //     let mut handle_interrupt = interrupt_pin_signal
+                            //         .try_get()
+                            //         .is_some_and(|pin_state| pin_state == PinState::Low);
+                            //     if pin_requests.iter().all(Option::is_none) && handle_interrupt {
+                            //         match select(
+                            //             select_array(
+                            //                 self.immutable
+                            //                     .pin_requests
+                            //                     .each_ref()
+                            //                     .map(Signal::wait),
+                            //             ),
+                            //             async {
+                            //                 receiver
+                            //                     .changed_and(|pin_state| {
+                            //                         *pin_state == PinState::Low
+                            //                     })
+                            //                     .await;
+                            //             },
+                            //         )
+                            //         .await
+                            //         {
+                            //             Either::First((message, index)) => {
+                            //                 pin_requests[index] = Some(message);
+                            //             }
+                            //             Either::Second(()) => {
+                            //                 handle_interrupt = true;
+                            //             }
+                            //         }
+                            //     }
+                            //     (pin_requests, handle_interrupt)
+                            // };
+
+                            // For each pin
+                            // If change direction, write the direction
+                            // If change pull, change the pull
+                            // If read_write, read or write
+                            // If change interrupts enabled or disabled, set interrupts enabled or disabled
+
+                            // If the direction is an input and interrupts for are enabled, the interrupt is active, and the  pin is not requested to be read, read INTF and GPIO.
+                        }
+                    },
+                )
+                .await
+                {
+                    Either::First(result) => result,
+                    Either::Second(result) => result,
                 }
-                .address(false),
-                // Enable interrupt mirroring and set interrupts to open-drain
-                0b01000100,
-            ],
+            },
+            array::from_fn(|index| Pin::new(&self.immutable.pins[index], index)),
         )
-        .await?;
-
-        Ok(Self {
-            reset_pin,
-            i2c: i2c.into(),
-            address_lower_bits,
-            interrupt_pin: interrupt_pin.into(),
-            unread_interrupts: Default::default(),
-            borrowed_pins: Default::default(),
-            registers_data: Default::default(),
-        })
     }
 }
-
-// impl<ResetPin: embedded_hal_async::digital::OutputPin<Error = Infallible>, I2c, InterruptPin>
-//     Mcp23017<ResetPin, I2c, InterruptPin>
-// {
-//     /// If you want to use an output pin with possible errors, make an issue.
-//     pub async fn reset(&mut self, delay: &mut impl DelayNs) {
-//         self.reset_pin.set_low().await;
-//         delay.delay_us(1).await;
-//         self.reset_pin.set_high().await;
-//     }
-// }
-
-// impl<ResetPin: embedded_hal::digital::OutputPin<Error = Infallible>, I2c, InterruptPin>
-//     Mcp23017<ResetPin, I2c, InterruptPin>
-// {
-//     /// If you want to use an output pin with possible errors, make an issue.
-//     pub async fn reset_sync_pin(&mut self, delay: &mut impl DelayNs) {
-//         self.reset_pin.set_low();
-//         // The docs say 1 us, but that isn't enough
-//         delay.delay_us(100).await;
-//         self.reset_pin.set_high();
-//     }
-// }
-
-impl<ResetPin, I2c, InterruptPin> Mcp23017<ResetPin, I2c, InterruptPin> {
-    fn address(&self) -> u8 {
-        address(self.address_lower_bits)
-    }
-
-    // pub fn output(&self) -> Output<'_, ResetPin, I2c, InterruptPin> {
-    //     // TODO: Don't allow the same pin to be borrowed twice at the same time
-    //     Output { mcp: self }
-    // }
-}
-
-impl<ResetPin, I2c: embedded_hal_async::i2c::I2c, InterruptPin>
-    Mcp23017<ResetPin, I2c, InterruptPin>
-{
-    pub async fn input(
-        &self,
-        index: usize,
-        pull_up_enabled: bool,
-    ) -> Result<Input<'_, ResetPin, I2c, InterruptPin>, I2c::Error> {
-        Input::new(self, index, pull_up_enabled).await
-    }
-}
-
-// pub struct Output<'a, ResetPin, I2c, InterruptPin> {
-//     mcp: &'a Mcp23017<ResetPin, I2c, InterruptPin>,
-// }

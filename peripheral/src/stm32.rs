@@ -5,6 +5,7 @@ use embassy_stm32::{
     gpio::{ExtiPin, Flex, Level, Pull, Speed},
     interrupt::typelevel::Binding,
 };
+use mcp23017_common::*;
 
 fn get_pull(pull_up_enabled: bool) -> Pull {
     if pull_up_enabled {

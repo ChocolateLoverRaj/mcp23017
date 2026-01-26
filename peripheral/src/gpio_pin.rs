@@ -1,30 +1,6 @@
 pub use embedded_hal::digital::PinState;
+use mcp23017_common::InterruptMode;
 pub use mcp23017_common::IoDirection;
-
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InterruptMode {
-    OpenDrain,
-    ActiveDriver,
-}
-
-impl From<bool> for InterruptMode {
-    fn from(value: bool) -> Self {
-        match value {
-            true => Self::OpenDrain,
-            false => Self::ActiveDriver,
-        }
-    }
-}
-
-impl From<InterruptMode> for bool {
-    fn from(value: InterruptMode) -> Self {
-        match value {
-            InterruptMode::OpenDrain => true,
-            InterruptMode::ActiveDriver => false,
-        }
-    }
-}
 
 pub trait GpioPin {
     fn configure(&mut self, io_direction: IoDirection, pull_up_enabled: bool, level: PinState);
