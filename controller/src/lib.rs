@@ -135,6 +135,15 @@ impl<I2c: embedded_hal_async::i2c::I2c, ResetPin: OutputPin, InterruptPin: Wait,
         impl Future<Output = Result<(), RunError<ResetPin::Error, InterruptPin::Error, I2c::Error>>>,
         [Pin<'_, mode::Input>; N_TOTAL_GPIO_PINS],
     ) {
+        self.immutable.pins = array::from_fn(|_| {
+            Watch::new_with(Request {
+                op: Op::Input {
+                    pull_up_enabled: false,
+                    op: None,
+                },
+                state: RequestState::Done,
+            })
+        });
         (
             async {
                 self.reset_pin.set_low().await.map_err(RunError::ResetPin)?;
@@ -180,6 +189,7 @@ impl<I2c: embedded_hal_async::i2c::I2c, ResetPin: OutputPin, InterruptPin: Wait,
                     },
                     async {
                         let mut receiver = interrupt_pin_signal.receiver().unwrap();
+                        let mut registers = [PinRegisters::default(); N_TOTAL_GPIO_PINS];
                         loop {
                             // Operations (each operation could be for A and/or B)
                             // Write I/O direction
@@ -200,48 +210,22 @@ impl<I2c: embedded_hal_async::i2c::I2c, ResetPin: OutputPin, InterruptPin: Wait,
                             // Write interrupt enabled
                             // Write
 
-                            // let (pin_requests, handle_interrupt) = {
-                            //     let mut pin_requests =
-                            //         self.immutable.pin_requests.each_ref().map(Signal::try_take);
-                            //     let mut handle_interrupt = interrupt_pin_signal
-                            //         .try_get()
-                            //         .is_some_and(|pin_state| pin_state == PinState::Low);
-                            //     if pin_requests.iter().all(Option::is_none) && handle_interrupt {
-                            //         match select(
-                            //             select_array(
-                            //                 self.immutable
-                            //                     .pin_requests
-                            //                     .each_ref()
-                            //                     .map(Signal::wait),
-                            //             ),
-                            //             async {
-                            //                 receiver
-                            //                     .changed_and(|pin_state| {
-                            //                         *pin_state == PinState::Low
-                            //                     })
-                            //                     .await;
-                            //             },
-                            //         )
-                            //         .await
-                            //         {
-                            //             Either::First((message, index)) => {
-                            //                 pin_requests[index] = Some(message);
-                            //             }
-                            //             Either::Second(()) => {
-                            //                 handle_interrupt = true;
-                            //             }
-                            //         }
-                            //     }
-                            //     (pin_requests, handle_interrupt)
-                            // };
-
-                            // For each pin
-                            // If change direction, write the direction
-                            // If change pull, change the pull
-                            // If read_write, read or write
-                            // If change interrupts enabled or disabled, set interrupts enabled or disabled
-
-                            // If the direction is an input and interrupts for are enabled, the interrupt is active, and the  pin is not requested to be read, read INTF and GPIO.
+                            for pin in &self.immutable.pins {
+                                let request = pin.try_get().unwrap();
+                                if request.state == RequestState::Requested {
+                                    match request.op {
+                                        Op::Output { latch } => todo!(),
+                                        Op::Input {
+                                            pull_up_enabled,
+                                            op,
+                                        } => todo!(),
+                                        Op::Watch {
+                                            pull_up_enabled,
+                                            last_known_value,
+                                        } => todo!(),
+                                    }
+                                }
+                            }
                         }
                     },
                 )
