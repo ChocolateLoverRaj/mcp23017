@@ -2,14 +2,21 @@ use crate::*;
 
 impl Pin<'_, mode::Output> {
     async fn set_state(&mut self, state: PinState) {
-        self.update_config(|config| {
-            config.latch = state;
-        })
-        .await;
+        self.update_op(Op::Output { latch: state }).await;
     }
 
     async fn is_set_state(&mut self, state: PinState) -> bool {
-        self.s.config.try_get().unwrap().latch == state
+        (match self
+            .s
+            .receiver()
+            .unwrap()
+            .changed_and(|request| request.state == RequestState::Done)
+            .await
+            .op
+        {
+            Op::Output { latch } => latch,
+            _ => unreachable!(),
+        }) == state
     }
 }
 

@@ -10,7 +10,10 @@ use core::{array, convert::Infallible, future::pending};
 
 use embassy_futures::select::{Either, select};
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, watch::Watch};
-use embedded_hal::digital::{ErrorType, PinState};
+use embedded_hal::{
+    digital::{ErrorType, PinState},
+    spi::Operation,
+};
 use embedded_hal_async::{
     delay::DelayNs,
     digital::{InputPin, OutputPin, StatefulOutputPin, Wait},
@@ -64,86 +67,51 @@ impl Default for PinRegisters {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct PinRequest {
-    new_config: PinRegisters,
-    read: bool,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct PinResponse {
-    set_config: PinRegisters,
-    read_state: Option<PinState>,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum ReadState {
-    Requested,
-    ProcessingRequest,
-    Done(PinState),
-}
-
-enum RequestedInputOp {}
-
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InputOp {
-    /// The runner reads the GPIO reg.
-    RequestedRead,
+    Read {
+        response: Option<PinState>,
+    },
     /// The runner sets the compare value to the opposite state and waits for an interrupt.
-    RequestedWaitForState(PinState),
+    WaitForState(PinState),
     /// The runner reads the GPIO reg, sets the compare value to compare with previous,
     /// and waits for an interrupt.
-    RequestAnyEdge,
+    WaitForAnyEdge,
     /// The runner reads the GPIO reg. sets the compare value to compare with previous,
     /// and waits for interrupts until the captured value is the specified final state.
     /// The runner should wait for up to 2 interrupts.
-    RequestSpecificEdge(PinState),
-    /// The runner sets the value to this
-    ProcessingRequest,
+    WaitForSpecificEdge {
+        after_state: PinState,
+    },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Op {
     /// Sets io direction to
-    Output {
-        latch: PinState,
+    Output { latch: PinState },
+    Input {
+        pull_up_enabled: bool,
+        op: Option<InputOp>,
     },
-    Input(Option<InputOp>),
-    Watch,
+    Watch {
+        pull_up_enabled: bool,
+        last_known_value: Option<PinState>,
+    },
 }
-
-struct PinOp {
-    set_config: PinRegisters,
-    requested_config: PinRegisters,
-    mode: Op,
-}
-
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Request {
-    request: Op,
+    op: Op,
     state: RequestState,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestState {
     Requested,
     ProcessingRequest,
     Done,
 }
 
-struct Mcp23017ImmutablePin {
-    /// Updated after successfully changing the configuration.
-    config: Watch<M, PinRegisters, 1>,
-    /// Updated to request the runner to change the configuration.
-    requested_config: Watch<M, PinRegisters, 1>,
-    /// Updated to request the runner to read the GPIO register,
-    /// and updated by the runner once it read it.
-    read: Watch<M, ReadState, 2>,
-    /// Updated to request the runner to wait for an interrupt and read INTCAP.
-    /// The runner makes sure that any previous INTF is cleared so that only
-    /// captured states *after* a request to read the edge are used.
-    /// Updated by the runner once the runner reads INTCAP.
-    read_edge: Watch<M, ReadState, 2>,
-    /// Used in input mode.
-    /// Updated by the runner with the value of GPIO or INTCAP.
-    watched_state: Watch<M, PinState, 1>,
-}
+type Mcp23017ImmutablePin = Watch<M, Request, 2>;
 
 struct Mcp23017Immutable {
     pins: [Mcp23017ImmutablePin; N_TOTAL_GPIO_PINS],
@@ -283,7 +251,7 @@ impl<I2c: embedded_hal_async::i2c::I2c, ResetPin: OutputPin, InterruptPin: Wait,
                     Either::Second(result) => result,
                 }
             },
-            array::from_fn(|index| Pin::new(&self.immutable.pins[index], index)),
+            array::from_fn(|index| Pin::new(&self.immutable.pins[index])),
         )
     }
 }

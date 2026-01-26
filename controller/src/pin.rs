@@ -2,63 +2,71 @@ use crate::*;
 
 pub struct Pin<'a, Mode> {
     pub(crate) s: &'a Mcp23017ImmutablePin,
-    pub(crate) index: usize,
     pub(crate) _mode: Mode,
 }
 
 impl<Mode> Pin<'_, Mode> {
-    pub(crate) async fn update_config(&mut self, update_fn: impl FnOnce(&mut PinRegisters)) {
-        let mut config = self.s.config.try_get().unwrap();
-        update_fn(&mut config);
-        self.s.requested_config.sender().send(config);
+    pub(crate) async fn update_op(&self, new_op: Op) {
+        self.s.sender().send_if_modified(|request| {
+            let request = request.as_mut().unwrap();
+            if &request.op != &new_op {
+                request.op = new_op;
+                true
+            } else {
+                false
+            }
+        });
         self.s
-            .config
             .receiver()
             .unwrap()
-            .changed_and(|set_config| set_config == &config)
+            .changed_and(|request| request.state == RequestState::Done)
             .await;
     }
 }
 
 impl<'a> Pin<'a, mode::Input> {
-    pub(crate) fn new(s: &'a Mcp23017ImmutablePin, index: usize) -> Self {
+    pub(crate) fn new(s: &'a Mcp23017ImmutablePin) -> Self {
         Self {
             s,
-            index,
             _mode: mode::Input,
         }
     }
 }
 
 impl<'a, Mode> Pin<'a, Mode> {
-    pub async fn into_output(mut self, initial_value: PinState) -> Pin<'a, mode::Output> {
-        self.update_config(|config| {
-            config.direction = IoDirection::Output;
-            config.latch = initial_value;
+    pub async fn into_output(self, initial_value: PinState) -> Pin<'a, mode::Output> {
+        self.update_op(Op::Output {
+            latch: initial_value,
         })
         .await;
         Pin {
             s: self.s,
-            index: self.index,
             _mode: mode::Output,
         }
     }
 
     pub async fn into_input(&mut self, pull_up_enabled: bool) -> Pin<'a, mode::Input> {
-        self.update_config(|config| {
-            config.direction = IoDirection::Input;
-            config.pull_up_enabled = pull_up_enabled;
+        self.update_op(Op::Input {
+            pull_up_enabled,
+            op: None,
         })
         .await;
         Pin {
             s: self.s,
-            index: self.index,
             _mode: mode::Input,
         }
     }
 
     pub async fn into_watch(&mut self, pull_up_enabled: bool) -> Pin<'a, mode::Watch> {
-        todo!()
+        self.update_op(Op::Watch {
+            pull_up_enabled,
+            last_known_value: None,
+        })
+        .await;
+        Pin {
+            s: self.s,
+            _mode: mode::Watch,
+        }
     }
 }
 

@@ -1,47 +1,62 @@
 use crate::*;
 
 impl Pin<'_, mode::Input> {
+    async fn op(&self, op: InputOp) -> InputOp {
+        self.s.sender().send_if_modified(|request| {
+            let request = request.as_mut().unwrap();
+            let pull_up_enabled = match request.op {
+                Op::Input {
+                    pull_up_enabled,
+                    op: _,
+                } => pull_up_enabled,
+                _ => unreachable!(),
+            };
+            let op = Op::Input {
+                pull_up_enabled,
+                op: Some(op),
+            };
+            if request.op != op {
+                *request = Request {
+                    op,
+                    state: RequestState::Requested,
+                };
+                true
+            } else if request.state == RequestState::Done {
+                request.state = RequestState::Requested;
+                true
+            } else {
+                false
+            }
+        });
+        match self
+            .s
+            .receiver()
+            .unwrap()
+            .changed_and(|request| request.state == RequestState::Done)
+            .await
+            .op
+        {
+            Op::Input {
+                pull_up_enabled: _,
+                op,
+            } => op.unwrap(),
+            _ => unreachable!(),
+        }
+    }
+
     async fn state(&self) -> PinState {
-        self.s.read.sender().send(ReadState::Requested);
-        let mut receiver = self.s.read.receiver().unwrap();
-        loop {
-            let read_state = receiver.changed().await;
-            if let ReadState::Done(state) = read_state {
-                break state;
-            }
+        match self.op(InputOp::Read { response: None }).await {
+            InputOp::Read { response } => response.unwrap(),
+            _ => unreachable!(),
         }
     }
 
-    /// Returns the final pin state after the edge.
-    async fn wait_for_edge(&self) -> PinState {
-        self.s.read_edge.sender().send(ReadState::Requested);
-        let mut receiver = self.s.read_edge.receiver().unwrap();
-        loop {
-            let read_edge_state = receiver.changed().await;
-            if let ReadState::Done(state) = read_edge_state {
-                break state;
-            }
-        }
-    }
-
-    async fn wait_for_specific_edge(&self, final_pin_state: PinState) {
-        loop {
-            if self.wait_for_edge().await == final_pin_state {
-                break;
-            }
-        }
+    async fn wait_for_specific_edge(&self, after_state: PinState) {
+        self.op(InputOp::WaitForSpecificEdge { after_state }).await;
     }
 
     async fn wait_for_state(&self, state: PinState) {
-        select(
-            async {
-                if self.state().await != state {
-                    pending().await
-                }
-            },
-            self.wait_for_specific_edge(state),
-        )
-        .await;
+        self.op(InputOp::WaitForState(state)).await;
     }
 }
 
@@ -77,7 +92,7 @@ impl Wait for Pin<'_, mode::Input> {
     }
 
     async fn wait_for_any_edge(&mut self) -> Result<(), Self::Error> {
-        self.wait_for_edge().await;
+        self.op(InputOp::WaitForAnyEdge).await;
         Ok(())
     }
 }
