@@ -42,7 +42,7 @@ pub enum RunError<ResetPinError, InterruptPinError, I2cError> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PinConfig {
+struct PinRegisters {
     direction: IoDirection,
     pull_up_enabled: bool,
     latch: PinState,
@@ -51,7 +51,7 @@ struct PinConfig {
     int_compare: PinState,
 }
 
-impl Default for PinConfig {
+impl Default for PinRegisters {
     fn default() -> Self {
         Self {
             direction: IoDirection::Input,
@@ -66,36 +66,80 @@ impl Default for PinConfig {
 
 #[derive(Debug, Clone, Copy)]
 struct PinRequest {
-    new_config: PinConfig,
+    new_config: PinRegisters,
     read: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
 struct PinResponse {
-    set_config: PinConfig,
+    set_config: PinRegisters,
     read_state: Option<PinState>,
 }
 
 #[derive(Debug, Clone, Copy)]
-enum ReadState2 {
+enum ReadState {
     Requested,
     ProcessingRequest,
     Done(PinState),
 }
 
+enum RequestedInputOp {}
+
+enum InputOp {
+    /// The runner reads the GPIO reg.
+    RequestedRead,
+    /// The runner sets the compare value to the opposite state and waits for an interrupt.
+    RequestedWaitForState(PinState),
+    /// The runner reads the GPIO reg, sets the compare value to compare with previous,
+    /// and waits for an interrupt.
+    RequestAnyEdge,
+    /// The runner reads the GPIO reg. sets the compare value to compare with previous,
+    /// and waits for interrupts until the captured value is the specified final state.
+    /// The runner should wait for up to 2 interrupts.
+    RequestSpecificEdge(PinState),
+    /// The runner sets the value to this
+    ProcessingRequest,
+}
+
+enum Op {
+    /// Sets io direction to
+    Output {
+        latch: PinState,
+    },
+    Input(Option<InputOp>),
+    Watch,
+}
+
+struct PinOp {
+    set_config: PinRegisters,
+    requested_config: PinRegisters,
+    mode: Op,
+}
+
+struct Request {
+    request: Op,
+    state: RequestState,
+}
+
+enum RequestState {
+    Requested,
+    ProcessingRequest,
+    Done,
+}
+
 struct Mcp23017ImmutablePin {
     /// Updated after successfully changing the configuration.
-    config: Watch<M, PinConfig, 1>,
+    config: Watch<M, PinRegisters, 1>,
     /// Updated to request the runner to change the configuration.
-    requested_config: Watch<M, PinConfig, 1>,
+    requested_config: Watch<M, PinRegisters, 1>,
     /// Updated to request the runner to read the GPIO register,
     /// and updated by the runner once it read it.
-    read: Watch<M, ReadState2, 2>,
+    read: Watch<M, ReadState, 2>,
     /// Updated to request the runner to wait for an interrupt and read INTCAP.
     /// The runner makes sure that any previous INTF is cleared so that only
     /// captured states *after* a request to read the edge are used.
     /// Updated by the runner once the runner reads INTCAP.
-    read_edge: Watch<M, ReadState2, 2>,
+    read_edge: Watch<M, ReadState, 2>,
     /// Used in input mode.
     /// Updated by the runner with the value of GPIO or INTCAP.
     watched_state: Watch<M, PinState, 1>,

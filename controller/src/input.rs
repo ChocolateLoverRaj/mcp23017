@@ -2,11 +2,11 @@ use crate::*;
 
 impl Pin<'_, mode::Input> {
     async fn state(&self) -> PinState {
-        self.s.read.sender().send(ReadState2::Requested);
+        self.s.read.sender().send(ReadState::Requested);
         let mut receiver = self.s.read.receiver().unwrap();
         loop {
             let read_state = receiver.changed().await;
-            if let ReadState2::Done(state) = read_state {
+            if let ReadState::Done(state) = read_state {
                 break state;
             }
         }
@@ -14,11 +14,11 @@ impl Pin<'_, mode::Input> {
 
     /// Returns the final pin state after the edge.
     async fn wait_for_edge(&self) -> PinState {
-        self.s.read_edge.sender().send(ReadState2::Requested);
+        self.s.read_edge.sender().send(ReadState::Requested);
         let mut receiver = self.s.read_edge.receiver().unwrap();
         loop {
             let read_edge_state = receiver.changed().await;
-            if let ReadState2::Done(state) = read_edge_state {
+            if let ReadState::Done(state) = read_edge_state {
                 break state;
             }
         }

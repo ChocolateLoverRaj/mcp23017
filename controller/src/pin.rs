@@ -7,7 +7,7 @@ pub struct Pin<'a, Mode> {
 }
 
 impl<Mode> Pin<'_, Mode> {
-    pub(crate) async fn update_config(&mut self, update_fn: impl FnOnce(&mut PinConfig)) {
+    pub(crate) async fn update_config(&mut self, update_fn: impl FnOnce(&mut PinRegisters)) {
         let mut config = self.s.config.try_get().unwrap();
         update_fn(&mut config);
         self.s.requested_config.sender().send(config);
