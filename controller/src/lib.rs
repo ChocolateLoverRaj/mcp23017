@@ -222,6 +222,7 @@ impl<I2c: embedded_hal_async::i2c::I2c, ResetPin: OutputPin, InterruptPin: Wait,
                             .each_ref()
                             .map(|pin| pin.receiver().unwrap());
                         let mut registers = [PinRegisters::default(); N_TOTAL_GPIO_PINS];
+                        let mut int_cap_wanted = [None; N_TOTAL_GPIO_PINS];
                         loop {
                             // Operations (each operation could be for A and/or B)
                             // Write I/O direction
@@ -284,10 +285,12 @@ impl<I2c: embedded_hal_async::i2c::I2c, ResetPin: OutputPin, InterruptPin: Wait,
                                             match op {
                                                 None => {
                                                     new_int_enabled[i] = false;
+                                                    int_cap_wanted[i] = None;
                                                 }
                                                 Some(InputOp::Read { response: _ }) => {
                                                     read_gpios[i] = true;
                                                     new_int_enabled[i] = false;
+                                                    int_cap_wanted[i] = None;
                                                 }
                                                 Some(InputOp::WaitForState(state)) => {
                                                     new_int_compare[i] = !state;
@@ -296,14 +299,24 @@ impl<I2c: embedded_hal_async::i2c::I2c, ResetPin: OutputPin, InterruptPin: Wait,
                                                         COMPARE_WITH_CONFIGURED_VALUE;
                                                     new_int_enabled[i] = true;
                                                     new_int_requested[i] = true;
+                                                    int_cap_wanted[i] = None;
                                                 }
                                                 Some(InputOp::WaitForAnyEdge) => {
                                                     new_int_control[i] =
                                                         InterruptControl::CompareWithPreviousValue;
                                                     new_int_enabled[i] = true;
                                                     new_int_requested[i] = true;
+                                                    int_cap_wanted[i] = None;
                                                 }
-                                                _ => todo!(),
+                                                Some(InputOp::WaitForSpecificEdge {
+                                                    after_state,
+                                                }) => {
+                                                    new_int_control[i] =
+                                                        InterruptControl::CompareWithPreviousValue;
+                                                    new_int_enabled[i] = true;
+                                                    new_int_requested[i] = true;
+                                                    int_cap_wanted[i] = Some(after_state);
+                                                }
                                             }
                                         }
                                         Op::Watch {
@@ -459,7 +472,23 @@ impl<I2c: embedded_hal_async::i2c::I2c, ResetPin: OutputPin, InterruptPin: Wait,
                             }
                             // We don't actually care about the captured value
                             let mut captured_interrupts = [false; N_TOTAL_GPIO_PINS];
+                            let mut int_cap_values = [None::<PinState>; N_TOTAL_GPIO_PINS];
+                            let mut read_gpio_states = [None; N_TOTAL_GPIO_PINS];
                             if pending_interrupt.try_get().unwrap() {
+                                // WaitForState and and WaitForAnyEdge only cares about the value of INTF, and doesn't care about INTCAP or GPIO.
+                                // WaitForSpecificEdge cares about the value of INTF and INTCAP, and doesn't care about GPIO.
+                                // In all cases, we must read either INTCAP or GPIO to clear the interrupt.
+
+                                // After disabling interrupts, either INTCAP or GPIO must be read to clear any immediate re-interrupts.
+
+                                // A pin in the same set may be requested to be read. We can combine this read of GPIO with
+                                // a read of GPIO that will be used to clear the interrupt.
+
+                                // No matter what, we should have up to two readings of INTCAP, up
+                                // and up to two readings of GPIO
+                                // The best-case scenario is only reading INTCAP once or GPIO once
+                                // The worst-case scenario is reading INTCAP once and GPIO once
+
                                 let no_interrupts_enabled =
                                     !registers.iter().any(|registers| registers.int_enabled);
                                 if no_interrupts_enabled {
@@ -471,7 +500,31 @@ impl<I2c: embedded_hal_async::i2c::I2c, ResetPin: OutputPin, InterruptPin: Wait,
                                 do_operation = true;
                                 let mut read_a = false;
                                 let mut int_flag_buffer = Vec::<_, 2>::new();
-                                let mut int_cap_buffer = Vec::<_, 2>::new();
+
+                                #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+                                enum RegisterToClearIntF {
+                                    Gpio,
+                                    IntCap,
+                                }
+                                impl RegisterToClearIntF {
+                                    pub fn _type(&self) -> RegisterType {
+                                        match self {
+                                            Self::Gpio => RegisterType::GPIO,
+                                            Self::IntCap => RegisterType::INTCAP,
+                                        }
+                                    }
+                                }
+                                let register_to_clear_int_f =
+                                    if int_cap_wanted.iter().any(Option::is_some) {
+                                        RegisterToClearIntF::IntCap
+                                    } else {
+                                        RegisterToClearIntF::Gpio
+                                    };
+
+                                #[cfg(feature = "defmt")]
+                                defmt::info!("{}", register_to_clear_int_f);
+
+                                let mut read_buffer = Vec::<_, 2>::new();
                                 for ab in AB::VARIANTS.iter().copied() {
                                     if registers[ab.range()]
                                         .iter()
@@ -482,31 +535,40 @@ impl<I2c: embedded_hal_async::i2c::I2c, ResetPin: OutputPin, InterruptPin: Wait,
                                             read_a = true;
                                         }
                                         int_flag_buffer.push(Default::default()).unwrap();
-                                        int_cap_buffer.push(Default::default()).unwrap();
+                                        read_buffer.push(Default::default()).unwrap();
                                     }
                                 }
                                 #[cfg(feature = "defmt")]
-                                defmt::trace!("reading INTF and GPIO");
+                                defmt::trace!("reading INTF");
+                                let mut operations = [
+                                    i2c::Operation::Write(&[Register {
+                                        _type: RegisterType::INTF,
+                                        ab: if read_a { AB::A } else { AB::B },
+                                    }
+                                    .address(false)]),
+                                    i2c::Operation::Read(&mut int_flag_buffer),
+                                    i2c::Operation::Write(&[Register {
+                                        _type: register_to_clear_int_f._type(),
+                                        ab: if read_a { AB::A } else { AB::B },
+                                    }
+                                    .address(false)]),
+                                    i2c::Operation::Read(&mut read_buffer),
+                                ];
+                                #[cfg(feature = "defmt")]
+                                defmt::trace!(
+                                    "operations: {:#04X}",
+                                    defmt::Debug2Format(&operations)
+                                );
                                 self.i2c
-                                    .transaction(
-                                        address,
-                                        &mut [
-                                            i2c::Operation::Write(&[Register {
-                                                _type: RegisterType::INTF,
-                                                ab: if read_a { AB::A } else { AB::B },
-                                            }
-                                            .address(false)]),
-                                            i2c::Operation::Read(&mut int_flag_buffer),
-                                            i2c::Operation::Write(&[Register {
-                                                _type: RegisterType::GPIO,
-                                                ab: if read_a { AB::A } else { AB::B },
-                                            }
-                                            .address(false)]),
-                                            i2c::Operation::Read(&mut int_cap_buffer),
-                                        ],
-                                    )
+                                    .transaction(address, &mut operations)
                                     .await
                                     .map_err(RunError::I2c)?;
+                                #[cfg(feature = "defmt")]
+                                defmt::trace!(
+                                    "read INTF: {:010b}, and: {:010b}.",
+                                    int_flag_buffer,
+                                    read_buffer,
+                                );
                                 for (i, ab) in AB::VARIANTS[if read_a {
                                     0..int_flag_buffer.len()
                                 } else {
@@ -518,13 +580,36 @@ impl<I2c: embedded_hal_async::i2c::I2c, ResetPin: OutputPin, InterruptPin: Wait,
                                 {
                                     captured_interrupts[ab.range()]
                                         .copy_from_slice(&int_flag_buffer[i].into_bits_le());
+                                    for (i, value) in
+                                        read_buffer[i].into_bits_le().into_iter().enumerate()
+                                    {
+                                        match register_to_clear_int_f {
+                                            RegisterToClearIntF::IntCap => {
+                                                int_cap_values[ab.starting_index() + i] =
+                                                    Some(value.into());
+                                            }
+                                            RegisterToClearIntF::Gpio => {
+                                                read_gpio_states[ab.starting_index() + i] =
+                                                    Some(value.into());
+                                            }
+                                        }
+                                    }
                                 }
                                 for i in 0..N_TOTAL_GPIO_PINS {
                                     // Disable interrupts unless there was a new request
-                                    // Also read GPIO to clear any immediate interrupts
                                     if captured_interrupts[i] && !new_int_requested[i] {
-                                        new_int_enabled[i] = false;
-                                        read_gpios[i] = true;
+                                        match int_cap_wanted[i] {
+                                            Some(wanted_after_state) => {
+                                                if int_cap_values[i].unwrap() == wanted_after_state
+                                                {
+                                                    int_cap_wanted[i] = None;
+                                                    new_int_enabled[i] = false;
+                                                }
+                                            }
+                                            None => {
+                                                new_int_enabled[i] = false;
+                                            }
+                                        }
                                     }
                                 }
                                 #[cfg(feature = "defmt")]
@@ -547,13 +632,17 @@ impl<I2c: embedded_hal_async::i2c::I2c, ResetPin: OutputPin, InterruptPin: Wait,
                                     .await
                                     .map_err(RunError::I2c)?;
                             }
-                            let mut read_gpio_states = [None; N_TOTAL_GPIO_PINS];
-                            if read_gpios.contains(&true) {
+                            let registers_to_read =
+                                array::from_fn::<_, N_TOTAL_GPIO_PINS, _>(|i| {
+                                    !new_int_enabled[i] && registers[i].int_enabled
+                                        || read_gpios[i] && read_gpio_states[i].is_none()
+                                });
+                            if registers_to_read.contains(&true) {
                                 do_operation = true;
                                 let mut read_a = false;
                                 let mut buffer = Vec::<_, 2>::new();
                                 for ab in AB::VARIANTS.iter().copied() {
-                                    if read_gpios[ab.range()].contains(&true) {
+                                    if registers_to_read[ab.range()].contains(&true) {
                                         if ab == AB::A {
                                             read_a = true;
                                         }
@@ -662,7 +751,16 @@ impl<I2c: embedded_hal_async::i2c::I2c, ResetPin: OutputPin, InterruptPin: Wait,
                                                         false
                                                     }
                                                 }
-                                                _ => false,
+                                                Some(InputOp::WaitForSpecificEdge {
+                                                    after_state,
+                                                }) => {
+                                                    if int_cap_values[i] == Some(*after_state) {
+                                                        request.state = RequestState::Done;
+                                                        true
+                                                    } else {
+                                                        false
+                                                    }
+                                                }
                                             },
                                             _ => false,
                                         }
