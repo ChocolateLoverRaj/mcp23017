@@ -297,6 +297,12 @@ impl<I2c: embedded_hal_async::i2c::I2c, ResetPin: OutputPin, InterruptPin: Wait,
                                                     new_int_enabled[i] = true;
                                                     new_int_requested[i] = true;
                                                 }
+                                                Some(InputOp::WaitForAnyEdge) => {
+                                                    new_int_control[i] =
+                                                        InterruptControl::CompareWithPreviousValue;
+                                                    new_int_enabled[i] = true;
+                                                    new_int_requested[i] = true;
+                                                }
                                                 _ => todo!(),
                                             }
                                         }
@@ -641,6 +647,14 @@ impl<I2c: embedded_hal_async::i2c::I2c, ResetPin: OutputPin, InterruptPin: Wait,
                                                     true
                                                 }
                                                 Some(InputOp::WaitForState(_)) => {
+                                                    if captured_interrupts[i] {
+                                                        request.state = RequestState::Done;
+                                                        true
+                                                    } else {
+                                                        false
+                                                    }
+                                                }
+                                                Some(InputOp::WaitForAnyEdge) => {
                                                     if captured_interrupts[i] {
                                                         request.state = RequestState::Done;
                                                         true
