@@ -538,17 +538,17 @@ impl<P: GpioPin, I: InterruptPin, R: Wait> Mcp23017<P, I, R> {
                     .iter_mut()
                     .enumerate()
                 {
-                    *state = match self.io_directions[i + register.ab.starting_index()] {
-                        IoDirection::Output => {
-                            self.output_latches[i + register.ab.starting_index()].into()
-                        }
+                    match self.io_directions[i + register.ab.starting_index()] {
+                        IoDirection::Output => {}
                         IoDirection::Input => {
-                            self.gpio_pins[i + register.ab.starting_index()].level()
+                            *state = self.gpio_pins[i + register.ab.starting_index()].level()
                         }
                     };
                 }
                 // The interrupt is cleared
                 self.int_flags[register.ab.range()].fill(false);
+                #[cfg(feature = "defmt")]
+                defmt::info!("cleared interrupts: {}", register.ab);
                 self.update_interrupts();
             }
             RegisterType::INTCAP => {
@@ -579,6 +579,12 @@ impl<P: GpioPin, I: InterruptPin, R: Wait> Mcp23017<P, I, R> {
                             if self.int_enabled[i] && !self.int_flags[i] {
                                 let compare_value = match self.interrupt_control[i] {
                                     InterruptControl::CompareWithConfiguredValue => {
+                                        #[cfg(feature = "defmt")]
+                                        defmt::warn!(
+                                            "pin {} comparing with {}",
+                                            i,
+                                            defmt::Debug2Format(&self.int_compare[i])
+                                        );
                                         self.int_compare[i]
                                     }
                                     InterruptControl::CompareWithPreviousValue => {

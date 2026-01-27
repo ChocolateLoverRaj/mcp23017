@@ -115,7 +115,10 @@ impl<'a> Stm32InterruptPin<'a> {
 
 impl InterruptPin for Stm32InterruptPin<'_> {
     fn configure(&mut self, mode: InterruptMode, level: PinState) {
-        self.pin.set_level(bool::from(level).into());
+        let level = bool::from(level).into();
+        #[cfg(feature = "defmt")]
+        defmt::info!("setting interrupt pin level to {}", level);
+        self.pin.set_level(level);
         match mode {
             InterruptMode::OpenDrain => {
                 self.pin.set_as_input_output(self.speed);
