@@ -11,6 +11,7 @@ impl<Mode> Pin<'_, Mode> {
             let request = request.as_mut().unwrap();
             if &request.op != &new_op {
                 request.op = new_op;
+                request.state = RequestState::Requested;
                 true
             } else {
                 false
@@ -45,7 +46,7 @@ impl<'a, Mode> Pin<'a, Mode> {
         }
     }
 
-    pub async fn into_input(&mut self, pull_up_enabled: bool) -> Pin<'a, mode::Input> {
+    pub async fn into_input(self, pull_up_enabled: bool) -> Pin<'a, mode::Input> {
         self.update_op(Op::Input {
             pull_up_enabled,
             op: None,
@@ -57,7 +58,7 @@ impl<'a, Mode> Pin<'a, Mode> {
         }
     }
 
-    pub async fn into_watch(&mut self, pull_up_enabled: bool) -> Pin<'a, mode::Watch> {
+    pub async fn into_watch(self, pull_up_enabled: bool) -> Pin<'a, mode::Watch> {
         self.update_op(Op::Watch {
             pull_up_enabled,
             last_known_value: None,

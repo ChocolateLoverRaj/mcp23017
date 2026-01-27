@@ -28,7 +28,7 @@ impl OutputPin for Pin<'_, mode::Output> {
 
     async fn set_high(&mut self) -> Result<(), Self::Error> {
         self.set_state(PinState::High).await;
-        todo!()
+        Ok(())
     }
 }
 

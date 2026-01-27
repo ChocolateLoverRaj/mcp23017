@@ -7,7 +7,7 @@ use strum::{EnumCount, FromRepr, VariantArray};
 pub const N_GPIO_PINS_PER_SET: usize = 8;
 pub const N_TOTAL_GPIO_PINS: usize = N_GPIO_PINS_PER_SET * AB::COUNT;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumCount, VariantArray)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, EnumCount, VariantArray, PartialOrd, Ord)]
 pub enum AB {
     A,
     B,

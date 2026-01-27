@@ -9,11 +9,13 @@ embassy-futures = "0.1.2"
 embassy-sync = "0.7.2"
 embedded-hal = "1.0.0"
 embedded-hal-async = "1.0.0"
+heapless = "0.9.2"
 mcp23017_common = { version = "0.1.0", path = "../common" }
+strum = { version = "0.27.2", default-features = false }
 
 [patch.crates-io]
 embedded-hal = { git = "https://github.com/rust-embedded/embedded-hal" }
 embedded-hal-async = { git = "https://github.com/rust-embedded/embedded-hal" }
 
 [features]
-defmt = ["dep:defmt"]
+defmt = ["dep:defmt", "heapless/defmt"]
