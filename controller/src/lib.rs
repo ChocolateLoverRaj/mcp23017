@@ -6,10 +6,10 @@ mod pin;
 mod util;
 mod watch;
 
-use core::{array, convert::Infallible, future::pending};
+use core::{array, convert::Infallible};
 
 use embassy_futures::select::{Either, select, select_array};
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal, watch::Watch};
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, watch::Watch};
 use embedded_hal::digital::{ErrorType, PinState};
 use embedded_hal_async::{
     delay::DelayNs,
@@ -132,12 +132,8 @@ pub struct Mcp23017<I2c, ResetPin, InterruptPin, Delay> {
     immutable: Mcp23017Immutable,
 }
 
-impl<
-    I2c: embedded_hal_async::i2c::I2c,
-    ResetPin: OutputPin,
-    InterruptPin: embedded_hal::digital::InputPin + Wait,
-    Delay: DelayNs,
-> Mcp23017<I2c, ResetPin, InterruptPin, Delay>
+impl<I2c: embedded_hal_async::i2c::I2c, ResetPin: OutputPin, InterruptPin: Wait, Delay: DelayNs>
+    Mcp23017<I2c, ResetPin, InterruptPin, Delay>
 {
     pub fn new(
         i2c: I2c,
@@ -200,44 +196,22 @@ impl<
                     .await
                     .map_err(RunError::I2c)?;
 
-                // let interrupt_pin_signal = Watch::<M, _, 1>::new_with(self.interrupt_pin);
-                // let low_signal = Signal::<M, ()>::new();
-                // let interrupt_acknowledged_signal = Signal::<M, ()>::new();
                 let pending_interrupt = Watch::<M, bool, 2>::new_with(false);
                 match select(
                     async {
-                        // loop {
-                        //     self.interrupt_pin.wait_for_low().await;
-                        //     low_signal.signal(());
-                        //     interrupt_acknowledged_signal.wait().await;
-                        // }
                         let mut receiver = pending_interrupt.receiver().unwrap();
                         loop {
                             #[cfg(feature = "defmt")]
-                            defmt::info!("waiting  for interrupt to go low");
-                            self.interrupt_pin.wait_for_low().await;
-                            defmt::info!("waiting interrupt pin went low");
+                            defmt::trace!("waiting  for interrupt to go low");
+                            self.interrupt_pin
+                                .wait_for_low()
+                                .await
+                                .map_err(RunError::InterruptPin)?;
+                            #[cfg(feature = "defmt")]
+                            defmt::trace!("waiting interrupt pin went low");
                             pending_interrupt.sender().send(true);
                             receiver.changed_and(|pending| !*pending).await;
                         }
-                        // let sender = interrupt_pin_signal.sender();
-                        // loop {
-                        //     self.interrupt_pin
-                        //         .wait_for_low()
-                        //         .await
-                        //         .map_err(RunError::InterruptPin)?;
-                        //     #[cfg(feature = "defmt")]
-                        //     defmt::info!("interrupt pin low");
-                        //     sender.send(PinState::Low);
-                        //     self.interrupt_pin
-                        //         .wait_for_high()
-                        //         .await
-                        //         .map_err(RunError::InterruptPin)?;
-                        //     #[cfg(feature = "defmt")]
-                        //     defmt::info!("interrupt pin high");
-                        //     sender.send(PinState::High);
-                        // }
-                        pending().await
                     },
                     async {
                         // let mut receiver = interrupt_pin_signal.receiver().unwrap();
@@ -419,7 +393,7 @@ impl<
                             ) {
                                 do_operation = true;
                                 #[cfg(feature = "defmt")]
-                                defmt::info!("updating IODIR");
+                                defmt::trace!("updating IODIR");
                                 self.i2c
                                     .transaction(address, &mut [operation.operation()])
                                     .await
@@ -432,7 +406,7 @@ impl<
                             ) {
                                 do_operation = true;
                                 #[cfg(feature = "defmt")]
-                                defmt::info!("updating GPPU");
+                                defmt::trace!("updating GPPU");
                                 self.i2c
                                     .transaction(address, &mut [operation.operation()])
                                     .await
@@ -445,7 +419,7 @@ impl<
                             ) {
                                 do_operation = true;
                                 #[cfg(feature = "defmt")]
-                                defmt::info!("updating OLAT");
+                                defmt::trace!("updating OLAT");
                                 self.i2c
                                     .transaction(address, &mut [operation.operation()])
                                     .await
@@ -458,7 +432,7 @@ impl<
                             ) {
                                 do_operation = true;
                                 #[cfg(feature = "defmt")]
-                                defmt::info!("updating DEFVAL");
+                                defmt::trace!("updating DEFVAL");
                                 self.i2c
                                     .transaction(address, &mut [operation.operation()])
                                     .await
@@ -471,7 +445,7 @@ impl<
                             ) {
                                 do_operation = true;
                                 #[cfg(feature = "defmt")]
-                                defmt::info!("updating INTCON");
+                                defmt::trace!("updating INTCON");
                                 self.i2c
                                     .transaction(address, &mut [operation.operation()])
                                     .await
@@ -506,7 +480,7 @@ impl<
                                     }
                                 }
                                 #[cfg(feature = "defmt")]
-                                defmt::info!("reading INTF and GPIO");
+                                defmt::trace!("reading INTF and GPIO");
                                 self.i2c
                                     .transaction(
                                         address,
@@ -548,7 +522,7 @@ impl<
                                     }
                                 }
                                 #[cfg(feature = "defmt")]
-                                defmt::info!(
+                                defmt::trace!(
                                     "captured interrupts: {}. expected: {}",
                                     captured_interrupts,
                                     !no_interrupts_enabled
@@ -561,7 +535,7 @@ impl<
                             ) {
                                 do_operation = true;
                                 #[cfg(feature = "defmt")]
-                                defmt::info!("updating GPINTEN to {}", new_int_enabled);
+                                defmt::trace!("updating GPINTEN to {}", new_int_enabled);
                                 self.i2c
                                     .transaction(address, &mut [operation.operation()])
                                     .await
@@ -581,7 +555,7 @@ impl<
                                     }
                                 }
                                 #[cfg(feature = "defmt")]
-                                defmt::info!("reading GPIO");
+                                defmt::trace!("reading GPIO");
                                 self.i2c
                                     .write_read(
                                         address,
@@ -620,7 +594,7 @@ impl<
                                 });
                             } else {
                                 #[cfg(feature = "defmt")]
-                                defmt::debug!("waiting for request");
+                                defmt::trace!("waiting for request");
                                 let request = select(
                                     select_array(
                                         receivers.each_mut().map(async |pin| pin.changed().await),
@@ -630,7 +604,7 @@ impl<
                                 )
                                 .await;
                                 #[cfg(feature = "defmt")]
-                                defmt::debug!("request: {}", defmt::Debug2Format(&request));
+                                defmt::trace!("request: {}", defmt::Debug2Format(&request));
                                 continue;
                             }
 
