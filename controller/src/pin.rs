@@ -7,21 +7,30 @@ pub struct Pin<'a, Mode> {
 
 impl<Mode> Pin<'_, Mode> {
     pub(crate) async fn update_op(&self, new_op: Op) {
-        self.s.sender().send_if_modified(|request| {
-            let request = request.as_mut().unwrap();
-            if &request.op != &new_op {
-                request.op = new_op;
-                request.state = RequestState::Requested;
-                true
-            } else {
-                false
+        {
+            let mut request = self.s.request.write().await;
+            if &request.op == &new_op {
+                return;
             }
-        });
-        self.s
-            .receiver()
-            .unwrap()
-            .changed_and(|request| request.state == RequestState::Done)
-            .await;
+            request.op = new_op;
+            request.state = RequestState::Requested;
+            #[cfg(feature = "defmt")]
+            defmt::trace!("pin signaling request");
+            self.s.request_signal.signal(());
+        }
+        loop {
+            {
+                let request = self.s.request.read().await;
+                if request.state == RequestState::Done {
+                    break;
+                }
+            }
+            #[cfg(feature = "defmt")]
+            defmt::trace!("pin waiting for response signal");
+            self.s.response_signal.wait().await;
+            #[cfg(feature = "defmt")]
+            defmt::trace!("pin received response signal");
+        }
     }
 }
 
@@ -59,11 +68,35 @@ impl<'a, Mode> Pin<'a, Mode> {
     }
 
     pub async fn into_watch(self, pull_up_enabled: bool) -> Pin<'a, mode::Watch> {
-        self.update_op(Op::Watch {
+        let new_op = Op::Watch {
             pull_up_enabled,
             last_known_value: None,
-        })
-        .await;
+        };
+        {
+            let mut request = self.s.request.write().await;
+            if &request.op != &new_op {
+                request.op = new_op;
+                request.state = RequestState::Requested;
+                self.s.request_signal.signal(());
+            }
+        }
+        loop {
+            {
+                let request = self.s.request.read().await;
+                match request.op {
+                    Op::Watch {
+                        pull_up_enabled: _,
+                        last_known_value,
+                    } => {
+                        if last_known_value.is_some() {
+                            break;
+                        }
+                    }
+                    _ => {}
+                };
+            }
+            self.s.response_signal.wait().await;
+        }
         Pin {
             s: self.s,
             _mode: mode::Watch,

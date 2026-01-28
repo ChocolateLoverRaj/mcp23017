@@ -6,17 +6,19 @@ impl Pin<'_, mode::Output> {
     }
 
     async fn is_set_state(&mut self, state: PinState) -> bool {
-        (match self
-            .s
-            .receiver()
-            .unwrap()
-            .changed_and(|request| request.state == RequestState::Done)
-            .await
-            .op
-        {
-            Op::Output { latch } => latch,
-            _ => unreachable!(),
-        }) == state
+        let set_state = loop {
+            {
+                let request = self.s.request.read().await;
+                if request.state == RequestState::Done {
+                    break match request.op {
+                        Op::Output { latch } => latch,
+                        _ => unreachable!(),
+                    };
+                }
+            }
+            self.s.response_signal.wait().await;
+        };
+        set_state == state
     }
 }
 

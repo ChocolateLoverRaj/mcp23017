@@ -3,26 +3,31 @@ mod input;
 pub mod mode;
 mod output;
 mod pin;
+mod register;
+mod runner;
 mod util;
 mod watch;
 
 use core::{array, convert::Infallible};
 
-use embassy_futures::select::{Either, select, select_array};
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, watch::Watch};
+use embassy_futures::select::{Either, select};
+use embassy_sync::{
+    blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex, rwlock::RwLock, signal::Signal,
+    watch::Watch,
+};
 use embedded_hal::digital::{ErrorType, PinState};
 use embedded_hal_async::{
     delay::DelayNs,
     digital::{InputPin, OutputPin, StatefulOutputPin, Wait},
-    i2c,
 };
 use heapless::Vec;
 use mcp23017_common::{
     AB, InterruptControl, IoDirection, N_TOTAL_GPIO_PINS, Register, RegisterType,
 };
 pub use pin::*;
-use strum::VariantArray;
 use util::*;
+
+use crate::runner::run;
 
 type M = CriticalSectionRawMutex;
 
@@ -51,7 +56,7 @@ pub enum RunError<ResetPinError, InterruptPinError, I2cError> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PinRegisters {
-    direction: IoDirection,
+    io_dir: IoDirection,
     pull_up_enabled: bool,
     latch: PinState,
     int_enabled: bool,
@@ -62,7 +67,7 @@ struct PinRegisters {
 impl Default for PinRegisters {
     fn default() -> Self {
         Self {
-            direction: IoDirection::Input,
+            io_dir: IoDirection::Input,
             pull_up_enabled: false,
             int_enabled: false,
             latch: PinState::Low,
@@ -117,19 +122,43 @@ enum RequestState {
     Done,
 }
 
-type Mcp23017ImmutablePin = Watch<M, Request, 2>;
+struct Mcp23017ImmutablePin {
+    request: RwLock<M, Request>,
+    request_signal: Signal<M, ()>,
+    response_signal: Signal<M, ()>,
+}
+
+impl Default for Mcp23017ImmutablePin {
+    fn default() -> Self {
+        Self {
+            request: RwLock::new(Request {
+                op: Op::Input {
+                    pull_up_enabled: false,
+                    op: None,
+                },
+                state: RequestState::Done,
+            }),
+            request_signal: Signal::new(),
+            response_signal: Signal::new(),
+        }
+    }
+}
 
 struct Mcp23017Immutable {
     pins: [Mcp23017ImmutablePin; N_TOTAL_GPIO_PINS],
 }
 
-pub struct Mcp23017<I2c, ResetPin, InterruptPin, Delay> {
+struct Mcp23017Mutable<I2c, ResetPin, InterruptPin, Delay> {
     i2c: I2c,
     address_lower_bits: [bool; 3],
     reset_pin: ResetPin,
     interrupt_pin: InterruptPin,
     delay: Delay,
+}
+
+pub struct Mcp23017<I2c, ResetPin, InterruptPin, Delay> {
     immutable: Mcp23017Immutable,
+    mutable: Mcp23017Mutable<I2c, ResetPin, InterruptPin, Delay>,
 }
 
 impl<I2c: embedded_hal_async::i2c::I2c, ResetPin: OutputPin, InterruptPin: Wait, Delay: DelayNs>
@@ -143,641 +172,34 @@ impl<I2c: embedded_hal_async::i2c::I2c, ResetPin: OutputPin, InterruptPin: Wait,
         delay: Delay,
     ) -> Self {
         Self {
-            i2c,
-            address_lower_bits,
-            reset_pin,
-            interrupt_pin,
-            delay,
             immutable: Mcp23017Immutable {
-                pins: array::from_fn(|_| Watch::new()),
+                pins: array::from_fn(|_| Default::default()),
+            },
+            mutable: Mcp23017Mutable {
+                i2c,
+                address_lower_bits,
+                reset_pin,
+                interrupt_pin,
+                delay,
             },
         }
     }
 
+    /// Get a runner future and access to pins.
+    /// The runner must be polled basically for the lifetime of the pins.
+    /// Currently, all errors will result in the error future being `Poll::Ready(Err(error)))`,
+    /// and the only way to recover from the error is to call `run` again.
+    ///
+    /// If you need to recover from errors and the API is too, inconvenient, create an issue.
     pub fn run(
         &mut self,
     ) -> (
         impl Future<Output = Result<(), RunError<ResetPin::Error, InterruptPin::Error, I2c::Error>>>,
         [Pin<'_, mode::Input>; N_TOTAL_GPIO_PINS],
     ) {
-        self.immutable.pins = array::from_fn(|_| {
-            Watch::new_with(Request {
-                op: Op::Input {
-                    pull_up_enabled: false,
-                    op: None,
-                },
-                state: RequestState::Done,
-            })
-        });
+        self.immutable.pins = array::from_fn(|_| Default::default());
         (
-            async {
-                self.reset_pin.set_low().await.map_err(RunError::ResetPin)?;
-                self.delay.delay_us(1).await;
-                self.reset_pin
-                    .set_high()
-                    .await
-                    .map_err(RunError::ResetPin)?;
-
-                // Configure IOCON
-                let address = address(self.address_lower_bits);
-                self.i2c
-                    .write(
-                        address,
-                        &[
-                            Register {
-                                _type: RegisterType::IOCON,
-                                ab: AB::A,
-                            }
-                            .address(false),
-                            // Enable interrupt mirroring and set interrupts to open-drain
-                            0b01000100,
-                        ],
-                    )
-                    .await
-                    .map_err(RunError::I2c)?;
-
-                let pending_interrupt = Watch::<M, bool, 2>::new_with(false);
-                match select(
-                    async {
-                        let mut receiver = pending_interrupt.receiver().unwrap();
-                        loop {
-                            #[cfg(feature = "defmt")]
-                            defmt::trace!("waiting  for interrupt to go low");
-                            self.interrupt_pin
-                                .wait_for_low()
-                                .await
-                                .map_err(RunError::InterruptPin)?;
-                            #[cfg(feature = "defmt")]
-                            defmt::trace!("waiting interrupt pin went low");
-                            pending_interrupt.sender().send(true);
-                            receiver.changed_and(|pending| !*pending).await;
-                        }
-                    },
-                    async {
-                        // let mut receiver = interrupt_pin_signal.receiver().unwrap();
-                        let mut receiver = pending_interrupt.receiver().unwrap();
-                        let mut receivers = self
-                            .immutable
-                            .pins
-                            .each_ref()
-                            .map(|pin| pin.receiver().unwrap());
-                        let mut registers = [PinRegisters::default(); N_TOTAL_GPIO_PINS];
-                        let mut int_cap_wanted = [None; N_TOTAL_GPIO_PINS];
-                        loop {
-                            // Operations (each operation could be for A and/or B)
-                            // Write I/O direction
-                            // Write
-                            let mut new_io_directions =
-                                registers.map(|registers| registers.direction);
-
-                            // Write pull up enabled
-                            // Write
-                            let mut new_pull_ups_enabled =
-                                registers.map(|registers| registers.pull_up_enabled);
-
-                            // Write latch
-                            // Write
-                            let mut new_latches = registers.map(|registers| registers.latch);
-
-                            // Write interrupt compare
-                            // Write
-                            let mut new_int_compare =
-                                registers.map(|registers| registers.int_compare);
-
-                            // Write interrupt control
-                            let mut new_int_control =
-                                registers.map(|registers| registers.int_control);
-
-                            // Write interrupt enabled
-                            let mut new_int_enabled =
-                                registers.map(|registers| registers.int_enabled);
-                            let mut new_int_requested = [false; N_TOTAL_GPIO_PINS];
-
-                            // Read GPIO
-                            let mut read_gpios = [false; N_TOTAL_GPIO_PINS];
-
-                            let read_requests = self
-                                .immutable
-                                .pins
-                                .each_ref()
-                                .map(|pin| pin.try_get().unwrap());
-                            for i in 0..N_TOTAL_GPIO_PINS {
-                                if read_requests[i].state == RequestState::Requested {
-                                    match read_requests[i].op {
-                                        Op::Output { latch } => {
-                                            if registers[i].direction != IoDirection::Output {
-                                                new_io_directions[i] = IoDirection::Output;
-                                            }
-                                            if registers[i].latch != latch {
-                                                new_latches[i] = latch;
-                                            }
-                                        }
-                                        Op::Input {
-                                            pull_up_enabled,
-                                            op,
-                                        } => {
-                                            if registers[i].direction != IoDirection::Input {
-                                                new_io_directions[i] = IoDirection::Input
-                                            }
-                                            if registers[i].pull_up_enabled != pull_up_enabled {
-                                                new_pull_ups_enabled[i] = pull_up_enabled;
-                                            }
-                                            match op {
-                                                None => {
-                                                    new_int_enabled[i] = false;
-                                                    int_cap_wanted[i] = None;
-                                                }
-                                                Some(InputOp::Read { response: _ }) => {
-                                                    read_gpios[i] = true;
-                                                    new_int_enabled[i] = false;
-                                                    int_cap_wanted[i] = None;
-                                                }
-                                                Some(InputOp::WaitForState(state)) => {
-                                                    new_int_compare[i] = !state;
-                                                    // This is causing formatting issues for some reason
-                                                    new_int_control[i] =
-                                                        COMPARE_WITH_CONFIGURED_VALUE;
-                                                    new_int_enabled[i] = true;
-                                                    new_int_requested[i] = true;
-                                                    int_cap_wanted[i] = None;
-                                                }
-                                                Some(InputOp::WaitForAnyEdge) => {
-                                                    new_int_control[i] =
-                                                        InterruptControl::CompareWithPreviousValue;
-                                                    new_int_enabled[i] = true;
-                                                    new_int_requested[i] = true;
-                                                    int_cap_wanted[i] = None;
-                                                }
-                                                Some(InputOp::WaitForSpecificEdge {
-                                                    after_state,
-                                                }) => {
-                                                    new_int_control[i] =
-                                                        InterruptControl::CompareWithPreviousValue;
-                                                    new_int_enabled[i] = true;
-                                                    new_int_requested[i] = true;
-                                                    int_cap_wanted[i] = Some(after_state);
-                                                }
-                                            }
-                                        }
-                                        Op::Watch {
-                                            pull_up_enabled,
-                                            last_known_value,
-                                        } => todo!(),
-                                    }
-                                    self.immutable.pins[i].sender().send_if_modified(|request| {
-                                        let request = request.as_mut().unwrap();
-                                        if request.op == read_requests[i].op {
-                                            request.state = RequestState::ProcessingRequest;
-                                            true
-                                        } else {
-                                            // TODO: Don't split into try_get and send_if_modified, cuz it creates a race condition
-                                            panic!()
-                                        }
-                                    });
-                                }
-                            }
-
-                            #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-                            #[derive(Debug)]
-                            enum OperationType {
-                                Read,
-                                Write,
-                            }
-
-                            #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-                            #[derive(Debug)]
-                            struct Operation {
-                                _type: OperationType,
-                                /// Largest size: [register address, register a value, register b value]
-                                buffer: Vec<u8, 3>,
-                            }
-
-                            impl Operation {
-                                pub fn operation(&mut self) -> i2c::Operation<'_> {
-                                    match self._type {
-                                        OperationType::Read => {
-                                            i2c::Operation::Read(&mut self.buffer)
-                                        }
-                                        OperationType::Write => i2c::Operation::Write(&self.buffer),
-                                    }
-                                }
-                            }
-
-                            // const MAX_OPERATIONS: usize = 3;
-                            // let mut operations = Vec::<Operation, MAX_OPERATIONS>::new();
-
-                            fn write_operation<T: Into<bool> + Copy + PartialEq>(
-                                register: RegisterType,
-                                current: [T; N_TOTAL_GPIO_PINS],
-                                new: [T; N_TOTAL_GPIO_PINS],
-                            ) -> Option<Operation> {
-                                if current != new {
-                                    Some(Operation {
-                                        _type: OperationType::Write,
-                                        buffer: {
-                                            let mut buffer = Vec::new();
-                                            // Placeholder for register address
-                                            buffer.push(Default::default()).unwrap();
-                                            let mut modified_a = false;
-                                            for ab in AB::VARIANTS.iter().copied() {
-                                                if current[ab.range()] != new[ab.range()] {
-                                                    if ab == AB::A {
-                                                        modified_a = true;
-                                                    }
-                                                    buffer
-                                                        .push(u8::from_bits_le(array::from_fn(
-                                                            |i| new[ab.range()][i].into(),
-                                                        )))
-                                                        .unwrap();
-                                                }
-                                            }
-                                            buffer[0] = Register {
-                                                _type: register,
-                                                ab: if modified_a { AB::A } else { AB::B },
-                                            }
-                                            .address(false);
-                                            buffer
-                                        },
-                                    })
-                                } else {
-                                    None
-                                }
-                            }
-
-                            let mut do_operation = false;
-                            if let Some(mut operation) = write_operation(
-                                RegisterType::IODIR,
-                                registers.map(|registers| registers.direction),
-                                new_io_directions,
-                            ) {
-                                do_operation = true;
-                                #[cfg(feature = "defmt")]
-                                defmt::trace!("updating IODIR");
-                                self.i2c
-                                    .transaction(address, &mut [operation.operation()])
-                                    .await
-                                    .map_err(RunError::I2c)?;
-                            }
-                            if let Some(mut operation) = write_operation(
-                                RegisterType::GPPU,
-                                registers.map(|registers| registers.pull_up_enabled),
-                                new_pull_ups_enabled,
-                            ) {
-                                do_operation = true;
-                                #[cfg(feature = "defmt")]
-                                defmt::trace!("updating GPPU");
-                                self.i2c
-                                    .transaction(address, &mut [operation.operation()])
-                                    .await
-                                    .map_err(RunError::I2c)?;
-                            }
-                            if let Some(mut operation) = write_operation(
-                                RegisterType::OLAT,
-                                registers.map(|registers| registers.latch),
-                                new_latches,
-                            ) {
-                                do_operation = true;
-                                #[cfg(feature = "defmt")]
-                                defmt::trace!("updating OLAT");
-                                self.i2c
-                                    .transaction(address, &mut [operation.operation()])
-                                    .await
-                                    .map_err(RunError::I2c)?;
-                            }
-                            if let Some(mut operation) = write_operation(
-                                RegisterType::DEFVAL,
-                                registers.map(|registers| registers.int_compare),
-                                new_int_compare,
-                            ) {
-                                do_operation = true;
-                                #[cfg(feature = "defmt")]
-                                defmt::trace!("updating DEFVAL");
-                                self.i2c
-                                    .transaction(address, &mut [operation.operation()])
-                                    .await
-                                    .map_err(RunError::I2c)?;
-                            }
-                            if let Some(mut operation) = write_operation(
-                                RegisterType::INTCON,
-                                registers.map(|registers| registers.int_control),
-                                new_int_control,
-                            ) {
-                                do_operation = true;
-                                #[cfg(feature = "defmt")]
-                                defmt::trace!("updating INTCON");
-                                self.i2c
-                                    .transaction(address, &mut [operation.operation()])
-                                    .await
-                                    .map_err(RunError::I2c)?;
-                            }
-                            // We don't actually care about the captured value
-                            let mut captured_interrupts = [false; N_TOTAL_GPIO_PINS];
-                            let mut int_cap_values = [None::<PinState>; N_TOTAL_GPIO_PINS];
-                            let mut read_gpio_states = [None; N_TOTAL_GPIO_PINS];
-                            if pending_interrupt.try_get().unwrap() {
-                                // WaitForState and and WaitForAnyEdge only cares about the value of INTF, and doesn't care about INTCAP or GPIO.
-                                // WaitForSpecificEdge cares about the value of INTF and INTCAP, and doesn't care about GPIO.
-                                // In all cases, we must read either INTCAP or GPIO to clear the interrupt.
-
-                                // After disabling interrupts, either INTCAP or GPIO must be read to clear any immediate re-interrupts.
-
-                                // A pin in the same set may be requested to be read. We can combine this read of GPIO with
-                                // a read of GPIO that will be used to clear the interrupt.
-
-                                // No matter what, we should have up to two readings of INTCAP, up
-                                // and up to two readings of GPIO
-                                // The best-case scenario is only reading INTCAP once or GPIO once
-                                // The worst-case scenario is reading INTCAP once and GPIO once
-
-                                let no_interrupts_enabled =
-                                    !registers.iter().any(|registers| registers.int_enabled);
-                                if no_interrupts_enabled {
-                                    #[cfg(feature = "defmt")]
-                                    defmt::warn!(
-                                        "interrupt pin is low even though no interrupts are enabled"
-                                    );
-                                }
-                                do_operation = true;
-                                let mut read_a = false;
-                                let mut int_flag_buffer = Vec::<_, 2>::new();
-
-                                #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-                                enum RegisterToClearIntF {
-                                    Gpio,
-                                    IntCap,
-                                }
-                                impl RegisterToClearIntF {
-                                    pub fn _type(&self) -> RegisterType {
-                                        match self {
-                                            Self::Gpio => RegisterType::GPIO,
-                                            Self::IntCap => RegisterType::INTCAP,
-                                        }
-                                    }
-                                }
-                                let register_to_clear_int_f =
-                                    if int_cap_wanted.iter().any(Option::is_some) {
-                                        RegisterToClearIntF::IntCap
-                                    } else {
-                                        RegisterToClearIntF::Gpio
-                                    };
-
-                                #[cfg(feature = "defmt")]
-                                defmt::info!("{}", register_to_clear_int_f);
-
-                                let mut read_buffer = Vec::<_, 2>::new();
-                                for ab in AB::VARIANTS.iter().copied() {
-                                    if registers[ab.range()]
-                                        .iter()
-                                        .any(|register| register.int_enabled)
-                                        | no_interrupts_enabled
-                                    {
-                                        if ab == AB::A {
-                                            read_a = true;
-                                        }
-                                        int_flag_buffer.push(Default::default()).unwrap();
-                                        read_buffer.push(Default::default()).unwrap();
-                                    }
-                                }
-                                #[cfg(feature = "defmt")]
-                                defmt::trace!("reading INTF");
-                                let mut operations = [
-                                    i2c::Operation::Write(&[Register {
-                                        _type: RegisterType::INTF,
-                                        ab: if read_a { AB::A } else { AB::B },
-                                    }
-                                    .address(false)]),
-                                    i2c::Operation::Read(&mut int_flag_buffer),
-                                    i2c::Operation::Write(&[Register {
-                                        _type: register_to_clear_int_f._type(),
-                                        ab: if read_a { AB::A } else { AB::B },
-                                    }
-                                    .address(false)]),
-                                    i2c::Operation::Read(&mut read_buffer),
-                                ];
-                                #[cfg(feature = "defmt")]
-                                defmt::trace!(
-                                    "operations: {:#04X}",
-                                    defmt::Debug2Format(&operations)
-                                );
-                                self.i2c
-                                    .transaction(address, &mut operations)
-                                    .await
-                                    .map_err(RunError::I2c)?;
-                                #[cfg(feature = "defmt")]
-                                defmt::trace!(
-                                    "read INTF: {:010b}, and: {:010b}.",
-                                    int_flag_buffer,
-                                    read_buffer,
-                                );
-                                for (i, ab) in AB::VARIANTS[if read_a {
-                                    0..int_flag_buffer.len()
-                                } else {
-                                    1..2
-                                }]
-                                .iter()
-                                .copied()
-                                .enumerate()
-                                {
-                                    captured_interrupts[ab.range()]
-                                        .copy_from_slice(&int_flag_buffer[i].into_bits_le());
-                                    for (i, value) in
-                                        read_buffer[i].into_bits_le().into_iter().enumerate()
-                                    {
-                                        match register_to_clear_int_f {
-                                            RegisterToClearIntF::IntCap => {
-                                                int_cap_values[ab.starting_index() + i] =
-                                                    Some(value.into());
-                                            }
-                                            RegisterToClearIntF::Gpio => {
-                                                read_gpio_states[ab.starting_index() + i] =
-                                                    Some(value.into());
-                                            }
-                                        }
-                                    }
-                                }
-                                for i in 0..N_TOTAL_GPIO_PINS {
-                                    // Disable interrupts unless there was a new request
-                                    if captured_interrupts[i] && !new_int_requested[i] {
-                                        match int_cap_wanted[i] {
-                                            Some(wanted_after_state) => {
-                                                if int_cap_values[i].unwrap() == wanted_after_state
-                                                {
-                                                    int_cap_wanted[i] = None;
-                                                    new_int_enabled[i] = false;
-                                                }
-                                            }
-                                            None => {
-                                                new_int_enabled[i] = false;
-                                            }
-                                        }
-                                    }
-                                }
-                                #[cfg(feature = "defmt")]
-                                defmt::trace!(
-                                    "captured interrupts: {}. expected: {}",
-                                    captured_interrupts,
-                                    !no_interrupts_enabled
-                                );
-                            }
-                            if let Some(mut operation) = write_operation(
-                                RegisterType::GPINTEN,
-                                registers.map(|registers| registers.int_enabled),
-                                new_int_enabled,
-                            ) {
-                                do_operation = true;
-                                #[cfg(feature = "defmt")]
-                                defmt::trace!("updating GPINTEN to {}", new_int_enabled);
-                                self.i2c
-                                    .transaction(address, &mut [operation.operation()])
-                                    .await
-                                    .map_err(RunError::I2c)?;
-                            }
-                            let registers_to_read =
-                                array::from_fn::<_, N_TOTAL_GPIO_PINS, _>(|i| {
-                                    !new_int_enabled[i] && registers[i].int_enabled
-                                        || read_gpios[i] && read_gpio_states[i].is_none()
-                                });
-                            if registers_to_read.contains(&true) {
-                                do_operation = true;
-                                let mut read_a = false;
-                                let mut buffer = Vec::<_, 2>::new();
-                                for ab in AB::VARIANTS.iter().copied() {
-                                    if registers_to_read[ab.range()].contains(&true) {
-                                        if ab == AB::A {
-                                            read_a = true;
-                                        }
-                                        buffer.push(Default::default()).unwrap();
-                                    }
-                                }
-                                #[cfg(feature = "defmt")]
-                                defmt::trace!("reading GPIO");
-                                self.i2c
-                                    .write_read(
-                                        address,
-                                        &[Register {
-                                            _type: RegisterType::GPIO,
-                                            ab: if read_a { AB::A } else { AB::B },
-                                        }
-                                        .address(false)],
-                                        &mut buffer,
-                                    )
-                                    .await
-                                    .map_err(RunError::I2c)?;
-                                for (i, ab) in AB::VARIANTS
-                                    [if read_a { 0..buffer.len() } else { 1..2 }]
-                                .iter()
-                                .copied()
-                                .enumerate()
-                                {
-                                    read_gpio_states[ab.range()].copy_from_slice(
-                                        &buffer[i]
-                                            .into_bits_le()
-                                            .map(|bool| Some(PinState::from(bool))),
-                                    );
-                                }
-                            }
-
-                            if do_operation {
-                                pending_interrupt.sender().send_if_modified(|pending| {
-                                    let pending = pending.as_mut().unwrap();
-                                    if *pending {
-                                        *pending = false;
-                                        true
-                                    } else {
-                                        false
-                                    }
-                                });
-                            } else {
-                                #[cfg(feature = "defmt")]
-                                defmt::trace!("waiting for request");
-                                let request = select(
-                                    select_array(
-                                        receivers.each_mut().map(async |pin| pin.changed().await),
-                                    ),
-                                    // self.interrupt_pin.wait_for_low(),
-                                    receiver.changed_and(|pending| *pending),
-                                )
-                                .await;
-                                #[cfg(feature = "defmt")]
-                                defmt::trace!("request: {}", defmt::Debug2Format(&request));
-                                continue;
-                            }
-
-                            for i in 0..N_TOTAL_GPIO_PINS {
-                                registers[i].direction = new_io_directions[i];
-                                registers[i].latch = new_latches[i];
-                                registers[i].int_compare = new_int_compare[i];
-                                registers[i].int_control = new_int_control[i];
-                                registers[i].int_enabled = new_int_enabled[i];
-                                self.immutable.pins[i].sender().send_if_modified(|request| {
-                                    let request = request.as_mut().unwrap();
-                                    if request
-                                        == (&Request {
-                                            op: read_requests[i].op,
-                                            state: RequestState::ProcessingRequest,
-                                        })
-                                    {
-                                        match &mut request.op {
-                                            Op::Output { latch } => {
-                                                request.state = RequestState::Done;
-                                                true
-                                            }
-                                            Op::Input {
-                                                pull_up_enabled: _,
-                                                op,
-                                            } => match op {
-                                                None => {
-                                                    request.state = RequestState::Done;
-                                                    true
-                                                }
-                                                Some(InputOp::Read { response }) => {
-                                                    *response = Some(read_gpio_states[i].unwrap());
-                                                    request.state = RequestState::Done;
-                                                    true
-                                                }
-                                                Some(InputOp::WaitForState(_)) => {
-                                                    if captured_interrupts[i] {
-                                                        request.state = RequestState::Done;
-                                                        true
-                                                    } else {
-                                                        false
-                                                    }
-                                                }
-                                                Some(InputOp::WaitForAnyEdge) => {
-                                                    if captured_interrupts[i] {
-                                                        request.state = RequestState::Done;
-                                                        true
-                                                    } else {
-                                                        false
-                                                    }
-                                                }
-                                                Some(InputOp::WaitForSpecificEdge {
-                                                    after_state,
-                                                }) => {
-                                                    if int_cap_values[i] == Some(*after_state) {
-                                                        request.state = RequestState::Done;
-                                                        true
-                                                    } else {
-                                                        false
-                                                    }
-                                                }
-                                            },
-                                            _ => false,
-                                        }
-                                    } else {
-                                        false
-                                    }
-                                });
-                            }
-                        }
-                    },
-                )
-                .await
-                {
-                    Either::First(result) => result,
-                    Either::Second(result) => result,
-                }
-            },
+            run(&mut self.mutable, &self.immutable),
             array::from_fn(|index| Pin::new(&self.immutable.pins[index])),
         )
     }

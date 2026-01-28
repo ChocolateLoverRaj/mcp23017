@@ -2,46 +2,47 @@ use crate::*;
 
 impl Pin<'_, mode::Input> {
     async fn op(&self, op: InputOp) -> InputOp {
-        self.s.sender().send_if_modified(|request| {
-            let request = request.as_mut().unwrap();
-            let pull_up_enabled = match request.op {
-                Op::Input {
-                    pull_up_enabled,
-                    op: _,
-                } => pull_up_enabled,
-                _ => unreachable!(),
-            };
-            let op = Op::Input {
-                pull_up_enabled,
-                op: Some(op),
-            };
-            if request.op != op {
-                *request = Request {
-                    op,
-                    state: RequestState::Requested,
-                };
-                true
-            } else if request.state == RequestState::Done {
-                request.state = RequestState::Requested;
-                true
-            } else {
-                false
-            }
-        });
-        match self
-            .s
-            .receiver()
-            .unwrap()
-            .changed_and(|request| request.state == RequestState::Done)
-            .await
-            .op
-        {
-            Op::Input {
-                pull_up_enabled: _,
-                op,
-            } => op.unwrap(),
-            _ => unreachable!(),
-        }
+        // self.s.sender().send_if_modified(|request| {
+        //     let request = request.as_mut().unwrap();
+        //     let pull_up_enabled = match request.op {
+        //         Op::Input {
+        //             pull_up_enabled,
+        //             op: _,
+        //         } => pull_up_enabled,
+        //         _ => unreachable!(),
+        //     };
+        //     let op = Op::Input {
+        //         pull_up_enabled,
+        //         op: Some(op),
+        //     };
+        //     if request.op != op {
+        //         *request = Request {
+        //             op,
+        //             state: RequestState::Requested,
+        //         };
+        //         true
+        //     } else if request.state == RequestState::Done {
+        //         request.state = RequestState::Requested;
+        //         true
+        //     } else {
+        //         false
+        //     }
+        // });
+        // match self
+        //     .s
+        //     .receiver()
+        //     .unwrap()
+        //     .changed_and(|request| request.state == RequestState::Done)
+        //     .await
+        //     .op
+        // {
+        //     Op::Input {
+        //         pull_up_enabled: _,
+        //         op,
+        //     } => op.unwrap(),
+        //     _ => unreachable!(),
+        // }
+        todo!()
     }
 
     async fn state(&self) -> PinState {
