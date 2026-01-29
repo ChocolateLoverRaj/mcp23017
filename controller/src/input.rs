@@ -1,7 +1,7 @@
 use crate::*;
 
 impl Pin<'_, mode::Input> {
-    async fn op(&self, op: InputOp) -> InputOp {
+    async fn op(&self, _op: InputOp) -> InputOp {
         // self.s.sender().send_if_modified(|request| {
         //     let request = request.as_mut().unwrap();
         //     let pull_up_enabled = match request.op {

@@ -71,6 +71,8 @@ pub async fn run<
             "Runner doing something because of {}",
             defmt::Debug2Format(&wake_up_source)
         );
+        #[cfg(not(feature = "defmt"))]
+        let _ = wake_up_source;
 
         // Read requests and immediately set them to processing, or done if no action is needed
         #[cfg(feature = "defmt")]
