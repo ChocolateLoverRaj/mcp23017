@@ -24,7 +24,7 @@ use mcp23017_common::{
 pub use pin::*;
 use util::*;
 
-use crate::runner::run;
+use crate::{mode::Input, runner::run};
 
 type M = CriticalSectionRawMutex;
 
@@ -154,6 +154,68 @@ pub struct Mcp23017<I2c, ResetPin, InterruptPin, Delay> {
     mutable: Mcp23017Mutable<I2c, ResetPin, InterruptPin, Delay>,
 }
 
+#[allow(non_snake_case)]
+pub struct InitialPins<'a> {
+    pub A0: Pin<'a, Input>,
+    pub A1: Pin<'a, Input>,
+    pub A2: Pin<'a, Input>,
+    pub A3: Pin<'a, Input>,
+    pub A4: Pin<'a, Input>,
+    pub A5: Pin<'a, Input>,
+    pub A6: Pin<'a, Input>,
+    pub A7: Pin<'a, Input>,
+    pub B0: Pin<'a, Input>,
+    pub B1: Pin<'a, Input>,
+    pub B2: Pin<'a, Input>,
+    pub B3: Pin<'a, Input>,
+    pub B4: Pin<'a, Input>,
+    pub B5: Pin<'a, Input>,
+    pub B6: Pin<'a, Input>,
+    pub B7: Pin<'a, Input>,
+}
+
+impl<'a> InitialPins<'a> {
+    fn new(pins: [Pin<'a, Input>; N_TOTAL_GPIO_PINS]) -> Self {
+        #[allow(non_snake_case)]
+        let [
+            A0,
+            A1,
+            A2,
+            A3,
+            A4,
+            A5,
+            A6,
+            A7,
+            B0,
+            B1,
+            B2,
+            B3,
+            B4,
+            B5,
+            B6,
+            B7,
+        ] = pins;
+        Self {
+            A0,
+            A1,
+            A2,
+            A3,
+            A4,
+            A5,
+            A6,
+            A7,
+            B0,
+            B1,
+            B2,
+            B3,
+            B4,
+            B5,
+            B6,
+            B7,
+        }
+    }
+}
+
 impl<I2c: embedded_hal_async::i2c::I2c, ResetPin: OutputPin, InterruptPin: Wait, Delay: DelayNs>
     Mcp23017<I2c, ResetPin, InterruptPin, Delay>
 {
@@ -188,12 +250,14 @@ impl<I2c: embedded_hal_async::i2c::I2c, ResetPin: OutputPin, InterruptPin: Wait,
         &mut self,
     ) -> (
         impl Future<Output = Result<(), RunError<ResetPin::Error, InterruptPin::Error, I2c::Error>>>,
-        [Pin<'_, mode::Input>; N_TOTAL_GPIO_PINS],
+        InitialPins<'_>,
     ) {
         self.immutable.pins = array::from_fn(|_| Default::default());
         (
             run(&mut self.mutable, &self.immutable),
-            array::from_fn(|index| Pin::new(&self.immutable.pins[index])),
+            InitialPins::new(array::from_fn(|index| {
+                Pin::new(&self.immutable.pins[index])
+            })),
         )
     }
 }

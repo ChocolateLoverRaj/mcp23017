@@ -15,7 +15,7 @@ impl Pin<'_, mode::Watch> {
     }
 
     /// Wait until the watched value changes.
-    /// After this, call [`Self::watched_value`].
+    /// After this, call [`Self::state`].
     /// It's possible that the watched value is the same as before even after this function returns.
     pub async fn watch(&mut self) {
         self.s.response_signal.wait().await;
