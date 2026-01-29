@@ -4,7 +4,10 @@ use embedded_hal_async::{
     digital::{OutputPin, Wait},
 };
 
-use crate::{register::write_registers, *};
+use crate::{
+    register::{read_registers, write_registers},
+    *,
+};
 
 pub async fn run<
     I2c: embedded_hal_async::i2c::I2c,
@@ -51,7 +54,7 @@ pub async fn run<
     loop {
         // Make sure we have something to do
         #[cfg(feature = "defmt")]
-        defmt::info!("Runner is idle");
+        defmt::trace!("Runner is idle");
         let wake_up_source = select(
             select_array(array::from_fn::<_, N_TOTAL_GPIO_PINS, _>(async |i| {
                 #[cfg(feature = "defmt")]
@@ -64,7 +67,7 @@ pub async fn run<
         )
         .await;
         #[cfg(feature = "defmt")]
-        defmt::info!(
+        defmt::trace!(
             "Runner doing something because of {}",
             defmt::Debug2Format(&wake_up_source)
         );
@@ -93,13 +96,24 @@ pub async fn run<
                     }
                     immutable.pins[i].response_signal.signal(());
                 }
+                Request {
+                    op:
+                        Op::Watch {
+                            pull_up_enabled: _,
+                            last_known_value: _,
+                        },
+                    state: RequestState::Requested,
+                } => {
+                    request.state = RequestState::ProcessingRequest;
+                    immutable.pins[i].response_signal.signal(());
+                }
                 _ => {}
             };
             request_before
         }))
         .await;
         #[cfg(feature = "defmt")]
-        defmt::info!("requests: {}", defmt::Debug2Format(&requests));
+        defmt::trace!("requests: {}", defmt::Debug2Format(&requests));
 
         // Update IODIR
         let new_io_dirs = requests.map(|request| match request.op {
@@ -137,6 +151,87 @@ pub async fn run<
             registers[i].latch = new_latches[i];
         }
 
+        // Update GPPU
+        let new_pull_ups_enabled =
+            array::from_fn::<_, N_TOTAL_GPIO_PINS, _>(|i| match requests[i].op {
+                Op::Watch {
+                    pull_up_enabled,
+                    last_known_value: _,
+                } => pull_up_enabled,
+                _ => registers[i].pull_up_enabled,
+            });
+        write_registers(
+            &mut mutable.i2c,
+            address,
+            RegisterType::GPPU,
+            registers.map(|register| register.pull_up_enabled),
+            new_pull_ups_enabled,
+        )
+        .await
+        .map_err(RunError::I2c)?;
+        for i in 0..N_TOTAL_GPIO_PINS {
+            registers[i].pull_up_enabled = new_pull_ups_enabled[i];
+        }
+
+        // Update GPINTEN
+        let new_int_enabled = array::from_fn::<_, N_TOTAL_GPIO_PINS, _>(|i| match requests[i].op {
+            Op::Watch {
+                pull_up_enabled: _,
+                last_known_value: _,
+            } => true,
+            _ => false,
+        });
+        let previous_int_enabled = registers.map(|register| register.int_enabled);
+        write_registers(
+            &mut mutable.i2c,
+            address,
+            RegisterType::GPINTEN,
+            previous_int_enabled,
+            new_int_enabled,
+        )
+        .await
+        .map_err(RunError::I2c)?;
+        for i in 0..N_TOTAL_GPIO_PINS {
+            registers[i].int_enabled = new_int_enabled[i];
+        }
+
+        // Read GPIO
+        // Read GPIO if disabling interrupts to clear any pending interrupts
+        let mut gpio_buffer = array::from_fn::<_, N_TOTAL_GPIO_PINS, _>(|i| {
+            if previous_int_enabled[i] && !new_int_enabled[i]
+                || match requests[i].op {
+                    Op::Watch {
+                        pull_up_enabled: _,
+                        last_known_value: _,
+                    } => {
+                        // TODO: Maybe don't read this unless we know an interrupt happened?
+                        true
+                    }
+                    _ => false,
+                }
+            {
+                Some(Default::default())
+            } else {
+                None
+            }
+        });
+        read_registers(
+            &mut mutable.i2c,
+            address,
+            RegisterType::GPIO,
+            &mut gpio_buffer,
+        )
+        .await
+        .map_err(RunError::I2c)?;
+        let read_gpio_states = gpio_buffer.map(|option| option.map(|value| PinState::from(value)));
+        #[cfg(feature = "defmt")]
+        defmt::trace!(
+            "read gpio states: {}",
+            defmt::Debug2Format(&read_gpio_states)
+        );
+
+        // TODO: Handle Input mode
+
         // Set requests to done if applicable
         // Only set requests to done if they were not modified since we read them
         join_array(array::from_fn::<_, N_TOTAL_GPIO_PINS, _>(async |i| {
@@ -144,10 +239,19 @@ pub async fn run<
             #[cfg(feature = "defmt")]
             defmt::trace!("request: {}", defmt::Debug2Format(&request));
             if requests[i].op == request.op && request.state == RequestState::ProcessingRequest {
-                match request.op {
+                match &mut request.op {
                     Op::Output { latch: _ } => {
                         request.state = RequestState::Done;
                         immutable.pins[i].response_signal.signal(());
+                    }
+                    Op::Watch {
+                        pull_up_enabled: _,
+                        last_known_value,
+                    } => {
+                        if read_gpio_states[i] != *last_known_value {
+                            *last_known_value = read_gpio_states[i];
+                            immutable.pins[i].response_signal.signal(());
+                        }
                     }
                     _ => {}
                 }

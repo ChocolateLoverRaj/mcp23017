@@ -10,11 +10,8 @@ mod watch;
 
 use core::{array, convert::Infallible};
 
-use embassy_futures::select::{Either, select};
-use embassy_sync::{
-    blocking_mutex::raw::CriticalSectionRawMutex, mutex::Mutex, rwlock::RwLock, signal::Signal,
-    watch::Watch,
-};
+use embassy_futures::select::select;
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, rwlock::RwLock, signal::Signal};
 use embedded_hal::digital::{ErrorType, PinState};
 use embedded_hal_async::{
     delay::DelayNs,
@@ -30,10 +27,6 @@ use util::*;
 use crate::runner::run;
 
 type M = CriticalSectionRawMutex;
-
-/// This constant exists to make Rust's auto-formatting of this file work
-const COMPARE_WITH_CONFIGURED_VALUE: InterruptControl =
-    InterruptControl::CompareWithConfiguredValue;
 
 const BASE_ADDRESS: u8 = 0x20;
 

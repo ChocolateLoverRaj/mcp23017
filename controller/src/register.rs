@@ -1,8 +1,5 @@
 use crate::*;
-use mcp23017_common::{
-    AB::{self, *},
-    N_GPIO_PINS_PER_SET, N_TOTAL_GPIO_PINS, Register, RegisterType,
-};
+use mcp23017_common::{AB::*, N_GPIO_PINS_PER_SET, N_TOTAL_GPIO_PINS, Register, RegisterType};
 
 /// Writes to A, B, both, or none,depending on the values that are `Some`.
 pub async fn write_registers<I2c: embedded_hal_async::i2c::I2c>(
@@ -80,7 +77,7 @@ pub async fn read_registers<I2c: embedded_hal_async::i2c::I2c>(
 
         let (a_byte, b_byte) = match (read_a, read_b) {
             (true, false) => (Some(buffer[0]), None),
-            (false, true) => (None, Some(buffer[1])),
+            (false, true) => (None, Some(buffer[0])),
             (true, true) => (Some(buffer[0]), Some(buffer[1])),
             _ => unreachable!(),
         };
