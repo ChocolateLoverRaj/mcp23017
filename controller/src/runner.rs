@@ -18,17 +18,17 @@ pub async fn run<
     mutable: &mut Mcp23017Mutable<I2c, ResetPin, InterruptPin, Delay>,
     immutable: &Mcp23017Immutable,
 ) -> Result<(), RunError<ResetPin::Error, InterruptPin::Error, I2c::Error>> {
-    mutable
-        .reset_pin
-        .set_low()
-        .await
-        .map_err(RunError::ResetPin)?;
-    mutable.delay.delay_us(1).await;
-    mutable
-        .reset_pin
-        .set_high()
-        .await
-        .map_err(RunError::ResetPin)?;
+    // mutable
+    //     .reset_pin
+    //     .set_low()
+    //     .await
+    //     .map_err(RunError::ResetPin)?;
+    // mutable.delay.delay_us(1).await;
+    // mutable
+    //     .reset_pin
+    //     .set_high()
+    //     .await
+    //     .map_err(RunError::ResetPin)?;
 
     // Configure IOCON
     let address = address(mutable.address_lower_bits);

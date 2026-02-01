@@ -4,6 +4,7 @@ use embassy_stm32::{
     exti::{Channel, ExtiInput, InterruptHandler},
     gpio::{ExtiPin, Flex, Level, Pull, Speed},
     interrupt::typelevel::Binding,
+    mode::Async,
 };
 use mcp23017_common::*;
 
@@ -16,8 +17,14 @@ fn get_pull(pull_up_enabled: bool) -> Pull {
 }
 
 enum Stm32GpioPinType<'a> {
-    ExtiInput { pin: ExtiInput<'a>, pull: Pull },
-    Flex { pin: Flex<'a>, speed: Speed },
+    ExtiInput {
+        pin: ExtiInput<'a, Async>,
+        pull: Pull,
+    },
+    Flex {
+        pin: Flex<'a>,
+        speed: Speed,
+    },
 }
 
 pub struct Stm32GpioPin<'a> {

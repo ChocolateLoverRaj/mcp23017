@@ -15,7 +15,7 @@ impl<Mode> Pin<'_, Mode> {
             request.op = new_op;
             request.state = RequestState::Requested;
             #[cfg(feature = "defmt")]
-            defmt::trace!("pin signaling request");
+            defmt::trace!("pin signaling request: {}", defmt::Debug2Format(&request));
             self.s.request_signal.signal(());
         }
         loop {
